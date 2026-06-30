@@ -37,20 +37,30 @@ with col2:
 run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
 
 ATYP_PAT = re.compile(
-    r'^(DA42|A20N|A21N|AT76|B738|B38M|C680|A332|A319|A321|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789)'
+    r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789)'
 )
-FLIGHT_LINE_PAT = re.compile(r'^(\d{2}:\d{2})A\s+(.*)$')
+TIME_PAT = re.compile(r'^(\d{2}:\d{2})A\s*(.*)$')
+FLIGHT_LINE_PAT = re.compile(r'^\d{2}:\d{2}A')
 
 
 def parse_pdf_flights(pdf_bytes):
-    """Extracts (Hora, ARCID, Aeronave, ADEP, ADES) from the NOP-style PDF text."""
+    """Extracts (Hora, ARCID, Aeronave, ADEP, ADES) from the NOP-style PDF text.
+
+    Each record follows the pattern: HH:MMA ARCID ATYP+REG(5)+ADEP(4)+ADES(4),
+    where spacing between tokens is inconsistent in the raw PDF text extraction
+    (the aircraft type can appear glued to the ARCID, and the destination
+    airport can appear glued to the registration/origin block). We locate the
+    aircraft type code first (known, finite list), split the ARCID off
+    everything before it, then use FIXED positional slicing on the remainder
+    (stripped of spaces) to recover REG / ADEP / ADES reliably, since the
+    registration is always 5 chars and airport codes are always 4 chars.
+    """
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         raw_lines = []
         for page in pdf.pages:
             txt = page.extract_text() or ""
             raw_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
 
-    # Re-merge wrapped lines: a new flight record always starts with HH:MMA
     merged = []
     current = None
     for ln in raw_lines:
@@ -65,23 +75,26 @@ def parse_pdf_flights(pdf_bytes):
 
     rows = []
     for ln in merged:
-        m = FLIGHT_LINE_PAT.match(ln)
+        m = TIME_PAT.match(ln)
         if not m:
             continue
         hora, rest = m.group(1), m.group(2)
-        parts = rest.split(" ", 1)
-        arcid = parts[0]
-        detail = parts[1] if len(parts) > 1 else ""
 
-        am = ATYP_PAT.match(detail)
-        atyp = am.group(1) if am else detail[:4]
-        remainder = detail[len(atyp):]
+        am = ATYP_PAT.search(rest)
+        if not am:
+            first_token = rest.split(" ")[0] if rest else ""
+            rows.append({"Hora": hora, "ARCID": first_token, "Aeronave": "",
+                         "ADEP": "", "ADES": "",
+                         "prefix3": first_token[:3]})
+            continue
 
-        seg = remainder.split(" ")
-        before = seg[0] if seg else ""
-        after = seg[-1] if len(seg) > 1 else ""
-        adep = before[-4:] if len(before) >= 4 else ""
-        ades = after if re.fullmatch(r'[A-Z]{4}', after or "") else ""
+        arcid = rest[:am.start()].strip()
+        atyp = am.group(1)
+        remainder = rest[am.end():]
+
+        nospace = remainder.replace(" ", "")
+        adep = nospace[5:9]
+        ades = nospace[9:13]
 
         rows.append({
             "Hora": hora,
