@@ -389,21 +389,105 @@ if run:
     for c, (tipo, n) in zip(cols, counts.items()):
         c.metric(tipo, n)
 
-    st.dataframe(result_df, use_container_width=True, height=500)
+    st.markdown("### Filtros antes de descargar")
+
+    fcol1, fcol2, fcol3 = st.columns(3)
+    with fcol1:
+        texto_busqueda = st.text_input("ARCID (texto libre)", "")
+    with fcol2:
+        ades_disponibles = sorted(
+            [a for a in result_df["ADES"].dropna().unique().tolist() if a]
+        )
+        ades_sel = st.multiselect("ADES (destino)", ades_disponibles, default=[])
+    with fcol3:
+        operadores_disponibles = sorted(
+            [o for o in result_df["Operador (maestro)"].dropna().unique().tolist() if o]
+        )
+        operadores_sel = st.multiselect("Operador", operadores_disponibles, default=[])
+
+    fcol4, fcol5, fcol6 = st.columns(3)
+    with fcol4:
+        tipos_disponibles = sorted(result_df["Tipo objetivo"].dropna().unique().tolist())
+        tipos_sel = st.multiselect(
+            "Tipo objetivo", tipos_disponibles, default=tipos_disponibles
+        )
+    with fcol5:
+        restantes_num = pd.to_numeric(result_df["Restantes"], errors="coerce")
+        max_restantes = int(restantes_num.max()) if restantes_num.notna().any() else 0
+        restantes_range = st.slider(
+            "Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1))
+        )
+    with fcol6:
+        fechas_validas = pd.to_datetime(result_df["Última inspección"], errors="coerce")
+        if fechas_validas.notna().any():
+            min_fecha, max_fecha = fechas_validas.min().date(), fechas_validas.max().date()
+        else:
+            min_fecha = max_fecha = datetime.now().date()
+        fecha_range = st.date_input(
+            "Última inspección (rango)", value=(min_fecha, max_fecha)
+        )
+
+    filtered_df = result_df.copy()
+    if texto_busqueda.strip():
+        filtered_df = filtered_df[
+            filtered_df["ARCID"].str.contains(texto_busqueda.strip(), case=False, na=False)
+        ]
+    if ades_sel:
+        filtered_df = filtered_df[filtered_df["ADES"].isin(ades_sel)]
+    if operadores_sel:
+        filtered_df = filtered_df[filtered_df["Operador (maestro)"].isin(operadores_sel)]
+    if tipos_sel:
+        filtered_df = filtered_df[filtered_df["Tipo objetivo"].isin(tipos_sel)]
+
+    rest_num_full = pd.to_numeric(filtered_df["Restantes"], errors="coerce")
+    filtered_df = filtered_df[
+        rest_num_full.isna() | rest_num_full.between(restantes_range[0], restantes_range[1])
+    ]
+
+    if isinstance(fecha_range, tuple) and len(fecha_range) == 2:
+        fechas_filtro = pd.to_datetime(filtered_df["Última inspección"], errors="coerce")
+        mask_fecha = fechas_filtro.isna() | (
+            (fechas_filtro.dt.date >= fecha_range[0]) & (fechas_filtro.dt.date <= fecha_range[1])
+        )
+        filtered_df = filtered_df[mask_fecha]
+
+    st.caption(f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros.")
+    st.dataframe(filtered_df, use_container_width=True, height=500)
+
+    excel_buf_filtered = build_excel(filtered_df.reset_index(drop=True), fecha_str)
+    pdf_buf_filtered = build_pdf(filtered_df.reset_index(drop=True), fecha_str)
 
     dcol1, dcol2 = st.columns(2)
     with dcol1:
         st.download_button(
-            "Descargar Excel enriquecido",
-            data=excel_buf,
-            file_name=f"GCTS_{fecha_str}_Enriquecido.xlsx",
+            "Descargar Excel (con filtros aplicados)",
+            data=excel_buf_filtered,
+            file_name=f"GCTS_{fecha_str}_Enriquecido_filtrado.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with dcol2:
         st.download_button(
-            "Descargar PDF reconstruido",
+            "Descargar PDF (con filtros aplicados)",
+            data=pdf_buf_filtered,
+            file_name=f"GCTS_{fecha_str}_Reconstruido_filtrado.pdf",
+            mime="application/pdf",
+        )
+
+    st.markdown("---")
+    st.caption("¿Necesitas todo sin filtrar? Descárgalo aquí:")
+    dcol3, dcol4 = st.columns(2)
+    with dcol3:
+        st.download_button(
+            "Descargar Excel completo (sin filtros)",
+            data=excel_buf,
+            file_name=f"GCTS_{fecha_str}_Enriquecido_completo.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with dcol4:
+        st.download_button(
+            "Descargar PDF completo (sin filtros)",
             data=pdf_buf,
-            file_name=f"GCTS_{fecha_str}_Reconstruido.pdf",
+            file_name=f"GCTS_{fecha_str}_Reconstruido_completo.pdf",
             mime="application/pdf",
         )
 else:
