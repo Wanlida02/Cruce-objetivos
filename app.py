@@ -377,10 +377,22 @@ if run:
 
         icao_map, l1_map, l2_map, sana_map = build_master_maps(xlsx_bytes)
         result_df = cross_reference(flights_df, icao_map, l1_map, l2_map, sana_map)
-
         fecha_str = datetime.now().strftime("%d-%m-%Y")
         excel_buf = build_excel(result_df, fecha_str)
-        pdf_buf = build_pdf(result_df, fecha_str)
+
+        # Persist results in session_state so that interacting with filter
+        # widgets afterwards (which also trigger a Streamlit rerun) does NOT
+        # discard the cross-reference results and force the user to click
+        # "Generar cruce" again.
+        st.session_state["result_df"] = result_df
+        st.session_state["excel_buf"] = excel_buf.getvalue()
+        st.session_state["fecha_str"] = fecha_str
+
+if "result_df" in st.session_state:
+    result_df = st.session_state["result_df"]
+    fecha_str = st.session_state["fecha_str"]
+    excel_buf = BytesIO(st.session_state["excel_buf"])
+    pdf_buf = build_pdf(result_df, fecha_str)
 
     st.success(f"Cruce completado: {len(result_df)} vuelos procesados.")
 
@@ -490,5 +502,5 @@ if run:
             file_name=f"GCTS_{fecha_str}_Reconstruido_completo.pdf",
             mime="application/pdf",
         )
-else:
+elif not run:
     st.info("Sube ambos archivos y pulsa 'Generar cruce' para empezar.")
