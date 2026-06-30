@@ -80,6 +80,15 @@ def parse_pdf_flights(pdf_bytes):
             continue
         hora, rest = m.group(1), m.group(2)
 
+        # Strip leading status/flight-state tokens (e.g. "LF", "LU", "LFU")
+        # that sometimes appear glued in front of the real ARCID. These are
+        # always pure letters with no digits, while a real ARCID always
+        # contains at least one digit.
+        tokens = rest.split(" ")
+        while tokens and re.fullmatch(r'[A-Z]{1,4}', tokens[0]) and not re.search(r'\d', tokens[0]):
+            tokens.pop(0)
+        rest = " ".join(tokens)
+
         am = ATYP_PAT.search(rest)
         if not am:
             first_token = rest.split(" ")[0] if rest else ""
