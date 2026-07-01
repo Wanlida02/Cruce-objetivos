@@ -1,4 +1,3 @@
-
 import re
 from io import BytesIO
 from datetime import datetime
@@ -44,18 +43,22 @@ ATYP_PAT = re.compile(
 TIME_PAT_F1 = re.compile(r'^(\d{2}:\d{2})A\s*(.*)$')
 FLIGHT_LINE_PAT_F1 = re.compile(r'^\d{2}:\d{2}A')
 
-# Format 2 (NM/CFMU detailed list): "HH:MM[A|E][status]ARCID ATYP REG ADEP ADES ..." with NO
-# space between the time indicator (A/E) and an optional 2-4 letter status code, which is
-# itself glued directly to the ARCID (e.g. "06:44ALURSC5SKAT76ECMIFGCTSGCLP ...").
-LINE_PAT_F2 = re.compile(r'^(\d{2}:\d{2})([AE])(.*)$')
+# Format 2 (NM/CFMU detailed list): "HH:MM[A|E|C][status]ARCID ATYP REG ADEP ADES ..." glued
+# together with NO space between the time indicator and what follows. Real NOP exports also use
+# 'C' as a status indicator (Cancelled/Changed), not just A/E, and pdfplumber sometimes fuses
+# two or three flight records into a single extracted text "line" when they share a row of the
+# original PDF table. FLIGHT_START_PAT_F2 is used with finditer (not a line-anchored match) so
+# every occurrence of "HH:MM[A|E|C]" inside a fused chunk of text is found and parsed separately,
+# instead of only the first one on that physical line.
+FLIGHT_START_PAT_F2 = re.compile(r'(\d{2}:\d{2})([AEC])')
 
 
 def _looks_like_format2(text_sample):
-    """Format 2 lines start with HH:MM followed directly by A or E (no space),
+    """Format 2 lines start with HH:MM followed directly by A, E or C (no space),
     while Format 1 lines always have a space after the leading 'A' status char."""
     for ln in text_sample.splitlines():
         ln = ln.strip()
-        if re.match(r'^\d{2}:\d{2}[AE]', ln):
+        if re.match(r'^\d{2}:\d{2}[AEC]', ln):
             return True
         if re.match(r'^\d{2}:\d{2}A\s', ln):
             return False
@@ -108,47 +111,62 @@ def _parse_format1(raw_lines):
     return pd.DataFrame(rows)
 
 
-def _parse_format2(raw_lines):
-    """Parses NM/CFMU-style detailed traffic lists, one flight per physical line,
-    where the airline code, status letters and flight number are all glued together
-    right after the HH:MM[A|E] time indicator, e.g.:
-    '06:44ALURSC5SKAT76ECMIFGCTSGCLP A09001-06:45+10:45 ...'
+def _parse_one_flight_chunk(hora, rest):
+    """Parses a single flight's text chunk (already isolated from any neighbouring
+    flights that pdfplumber may have fused onto the same physical line) starting
+    right after the HH:MM[A|E|C] indicator, e.g.:
+    'LU RSC5SK AT76 EC-MIF GCTS GCLP A090 01-06:45+10:45 06:55E fI 06:44aT  10 N    N'
     """
+    rest = rest.lstrip()
+
+    am = ATYP_PAT.search(rest)
+    if not am:
+        return None
+
+    prefix = rest[:am.start()]
+    atyp = am.group(1)
+    remainder = rest[am.end():]
+
+    dm = re.search(r'\d', prefix)
+    if dm:
+        alpha_run = prefix[:dm.start()]
+        digit_start = dm.start()
+    else:
+        alpha_run = prefix
+        digit_start = len(prefix)
+
+    airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
+    arcid = airline_code + prefix[digit_start:]
+
+    nospace_field = remainder.split(" ")[0]
+    adep = nospace_field[5:9]
+    ades = nospace_field[9:13]
+
+    return {
+        "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "ADEP": adep, "ADES": ades,
+        "prefix3": airline_code.strip(),
+    }
+
+
+def _parse_format2(raw_lines):
+    """Parses NM/CFMU-style detailed traffic lists. Uses finditer over each raw text
+    line to find EVERY "HH:MM[A|E|C]" occurrence, because pdfplumber sometimes extracts
+    two or three flight rows from the source PDF table as a single fused text line.
+    Splitting on every match (instead of anchoring only at the start of the line with
+    re.match) ensures no flight is silently dropped when this fusion happens."""
     rows = []
     for ln in raw_lines:
-        m = LINE_PAT_F2.match(ln)
-        if not m:
+        matches = list(FLIGHT_START_PAT_F2.finditer(ln))
+        if not matches:
             continue
-        hora, indicator, rest = m.group(1), m.group(2), m.group(3)
-        rest = rest.lstrip()
-
-        am = ATYP_PAT.search(rest)
-        if not am:
-            continue
-
-        prefix = rest[:am.start()]
-        atyp = am.group(1)
-        remainder = rest[am.end():]
-
-        dm = re.search(r'\d', prefix)
-        if dm:
-            alpha_run = prefix[:dm.start()]
-            digit_start = dm.start()
-        else:
-            alpha_run = prefix
-            digit_start = len(prefix)
-
-        airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
-        arcid = airline_code + prefix[digit_start:]
-
-        nospace_field = remainder.split(" ")[0]
-        adep = nospace_field[5:9]
-        ades = nospace_field[9:13]
-
-        rows.append({
-            "Hora": hora, "ARCID": arcid, "Aeronave": atyp, "ADEP": adep, "ADES": ades,
-            "prefix3": airline_code,
-        })
+        for i, m in enumerate(matches):
+            hora = m.group(1)
+            chunk_start = m.end()
+            chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
+            chunk = ln[chunk_start:chunk_end]
+            parsed = _parse_one_flight_chunk(hora, chunk)
+            if parsed:
+                rows.append(parsed)
     return pd.DataFrame(rows)
 
 
@@ -166,6 +184,65 @@ def extract_expected_total(pdf_bytes):
             if m:
                 return int(m.group(1))
     return None
+
+
+def extract_raw_arcid_candidates(pdf_bytes):
+    """Scans the raw PDF text for every 'HH:MM[A|E|C]' flight-start marker, returning
+    the count found. Used purely as a diagnostic signal (independent of the actual
+    parsed DataFrame) to detect flights that were present in the source text but did
+    not make it into the final parsed result, e.g. due to an unrecognised aircraft
+    type code or a malformed remainder field."""
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        raw_lines = []
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            raw_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
+
+    full_text = "\n".join(raw_lines)
+    if _looks_like_format2(full_text):
+        candidates = []
+        for ln in raw_lines:
+            matches = list(FLIGHT_START_PAT_F2.finditer(ln))
+            for i, m in enumerate(matches):
+                hora = m.group(1)
+                chunk_start = m.end()
+                chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
+                chunk = ln[chunk_start:chunk_end].lstrip()
+                am = ATYP_PAT.search(chunk)
+                prefix = chunk[:am.start()] if am else chunk[:12]
+                dm = re.search(r'\d', prefix)
+                alpha_run = prefix[:dm.start()] if dm else prefix
+                digit_start = dm.start() if dm else len(prefix)
+                airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
+                arcid_guess = airline_code + prefix[digit_start:]
+                candidates.append({"Hora": hora, "ARCID_guess": arcid_guess.strip(), "parsed_ok": am is not None})
+        return pd.DataFrame(candidates)
+    else:
+        merged = []
+        current = None
+        for ln in raw_lines:
+            if FLIGHT_LINE_PAT_F1.match(ln):
+                if current:
+                    merged.append(current)
+                current = ln
+            elif current:
+                current += " " + ln
+        if current:
+            merged.append(current)
+        candidates = []
+        for ln in merged:
+            m = TIME_PAT_F1.match(ln)
+            if not m:
+                continue
+            hora, rest = m.group(1), m.group(2)
+            tokens = rest.split(" ")
+            while tokens and re.fullmatch(r'[A-Z]{1,4}', tokens[0]) and not re.search(r'\d', tokens[0]):
+                tokens.pop(0)
+            rest2 = " ".join(tokens)
+            am = ATYP_PAT.search(rest2)
+            arcid_guess = rest2[:am.start()].strip() if am else (rest2.split(" ")[0] if rest2 else "")
+            candidates.append({"Hora": hora, "ARCID_guess": arcid_guess, "parsed_ok": am is not None})
+        return pd.DataFrame(candidates)
 
 
 def parse_pdf_flights(pdf_bytes):
@@ -348,8 +425,8 @@ def build_excel(df, fecha_str):
                 val = None
             c = ws.cell(row=r, column=j, value=val)
             c.font, c.border = body_font, border
-            c.alignment = Alignment(horizontal="center", vertical="center") if h in centered \
-                else Alignment(horizontal="left", vertical="center", indent=1)
+            c.alignment = (Alignment(horizontal="center", vertical="center") if h in centered
+                           else Alignment(horizontal="left", vertical="center", indent=1))
 
     last_row = header_row + len(df)
     last_col = 1 + len(headers)
@@ -452,6 +529,10 @@ if run:
         fecha_str = datetime.now().strftime("%d-%m-%Y")
         excel_buf = build_excel(result_df, fecha_str)
 
+        # Also compute the raw-text diagnostic pass (independent of the final DataFrame)
+        # so we can offer a "vuelos no detectados" comparison button afterwards.
+        raw_candidates_df = extract_raw_arcid_candidates(pdf_bytes)
+
         # Persist results in session_state so that interacting with filter
         # widgets, or downloading a file (which also triggers a Streamlit
         # rerun / navigation on some browsers, e.g. inline PDF viewers),
@@ -462,11 +543,13 @@ if run:
         st.session_state["excel_buf"] = excel_buf.getvalue()
         st.session_state["fecha_str"] = fecha_str
         st.session_state["expected_total"] = expected_total
+        st.session_state["raw_candidates_df"] = raw_candidates_df
 
 if "result_df" in st.session_state:
     result_df = st.session_state["result_df"]
     fecha_str = st.session_state["fecha_str"]
     expected_total = st.session_state.get("expected_total")
+    raw_candidates_df = st.session_state.get("raw_candidates_df")
     excel_buf = BytesIO(st.session_state["excel_buf"])
     pdf_buf = build_pdf(result_df, fecha_str)
 
@@ -489,6 +572,30 @@ if "result_df" in st.session_state:
                 f"⚠️ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). "
                 f"Faltan {missing} vuelo(s) por identificar; revisa manualmente el PDF original para esos casos."
             )
+
+        # Comparison button: show which flights were found in the raw PDF text
+        # (via the HH:MM[A|E|C] marker scan) but did not end up in the final
+        # parsed/cross-referenced table.
+        if missing > 0 and raw_candidates_df is not None and not raw_candidates_df.empty:
+            if st.button("Ver vuelos no detectados"):
+                detected_arcids = set(result_df["ARCID"].astype(str).str.upper())
+                raw_candidates_df["ARCID_norm"] = raw_candidates_df["ARCID_guess"].astype(str).str.upper()
+                no_detectados = raw_candidates_df[~raw_candidates_df["ARCID_norm"].isin(detected_arcids)]
+                if no_detectados.empty:
+                    st.success("No se han encontrado vuelos adicionales sin detectar (la diferencia puede deberse a duplicados o formato de hora).")
+                else:
+                    st.markdown(f"**{len(no_detectados)} vuelo(s) presentes en el texto del PDF pero ausentes en la tabla final:**")
+                    st.dataframe(
+                        no_detectados[["Hora", "ARCID_guess", "parsed_ok"]].rename(
+                            columns={"ARCID_guess": "ARCID (detectado en texto crudo)", "parsed_ok": "Se pudo parsear tipo/aeropuertos"}
+                        ),
+                        use_container_width=True,
+                    )
+                    st.caption(
+                        "Estos vuelos aparecen en el texto extraído del PDF (marcador de hora + indicador A/E/C) "
+                        "pero no llegaron a la tabla final, normalmente porque el tipo de aeronave no coincide con "
+                        "los códigos reconocidos (ATYP_PAT) o porque el bloque de texto quedó incompleto."
+                    )
     else:
         st.caption(f"No se ha podido leer el total declarado de vuelos en el PDF; se muestran los {len(result_df)} vuelos detectados.")
 
