@@ -39,32 +39,34 @@ run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx
 ATYP_PAT = re.compile(
     r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789)'
 )
-TIME_PAT = re.compile(r'^(\d{2}:\d{2})A\s*(.*)$')
-FLIGHT_LINE_PAT = re.compile(r'^\d{2}:\d{2}A')
+
+# Format 1 (simple traffic list): "HH:MMA ARCID ATYP+REG+ADEP ADES" per physical line.
+TIME_PAT_F1 = re.compile(r'^(\d{2}:\d{2})A\s*(.*)$')
+FLIGHT_LINE_PAT_F1 = re.compile(r'^\d{2}:\d{2}A')
+
+# Format 2 (NM/CFMU detailed list): "HH:MM[A|E][status]ARCID ATYP REG ADEP ADES ..." with NO
+# space between the time indicator (A/E) and an optional 2-4 letter status code, which is
+# itself glued directly to the ARCID (e.g. "06:44ALURSC5SKAT76ECMIFGCTSGCLP ...").
+LINE_PAT_F2 = re.compile(r'^(\d{2}:\d{2})([AE])(.*)$')
 
 
-def parse_pdf_flights(pdf_bytes):
-    """Extracts (Hora, ARCID, Aeronave, ADEP, ADES) from the NOP-style PDF text.
+def _looks_like_format2(text_sample):
+    """Format 2 lines start with HH:MM followed directly by A or E (no space),
+    while Format 1 lines always have a space after the leading 'A' status char."""
+    for ln in text_sample.splitlines():
+        ln = ln.strip()
+        if re.match(r'^\d{2}:\d{2}[AE]', ln):
+            return True
+        if re.match(r'^\d{2}:\d{2}A\s', ln):
+            return False
+    return False
 
-    Each record follows the pattern: HH:MMA ARCID ATYP+REG(5)+ADEP(4)+ADES(4),
-    where spacing between tokens is inconsistent in the raw PDF text extraction
-    (the aircraft type can appear glued to the ARCID, and the destination
-    airport can appear glued to the registration/origin block). We locate the
-    aircraft type code first (known, finite list), split the ARCID off
-    everything before it, then use FIXED positional slicing on the remainder
-    (stripped of spaces) to recover REG / ADEP / ADES reliably, since the
-    registration is always 5 chars and airport codes are always 4 chars.
-    """
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        raw_lines = []
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            raw_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
 
+def _parse_format1(raw_lines):
     merged = []
     current = None
     for ln in raw_lines:
-        if FLIGHT_LINE_PAT.match(ln):
+        if FLIGHT_LINE_PAT_F1.match(ln):
             if current:
                 merged.append(current)
             current = ln
@@ -75,15 +77,11 @@ def parse_pdf_flights(pdf_bytes):
 
     rows = []
     for ln in merged:
-        m = TIME_PAT.match(ln)
+        m = TIME_PAT_F1.match(ln)
         if not m:
             continue
         hora, rest = m.group(1), m.group(2)
 
-        # Strip leading status/flight-state tokens (e.g. "LF", "LU", "LFU")
-        # that sometimes appear glued in front of the real ARCID. These are
-        # always pure letters with no digits, while a real ARCID always
-        # contains at least one digit.
         tokens = rest.split(" ")
         while tokens and re.fullmatch(r'[A-Z]{1,4}', tokens[0]) and not re.search(r'\d', tokens[0]):
             tokens.pop(0)
@@ -93,27 +91,83 @@ def parse_pdf_flights(pdf_bytes):
         if not am:
             first_token = rest.split(" ")[0] if rest else ""
             rows.append({"Hora": hora, "ARCID": first_token, "Aeronave": "",
-                         "ADEP": "", "ADES": "",
-                         "prefix3": first_token[:3]})
+                         "ADEP": "", "ADES": "", "prefix3": first_token[:3]})
             continue
 
         arcid = rest[:am.start()].strip()
         atyp = am.group(1)
         remainder = rest[am.end():]
-
         nospace = remainder.replace(" ", "")
         adep = nospace[5:9]
         ades = nospace[9:13]
 
         rows.append({
-            "Hora": hora,
-            "ARCID": arcid,
-            "Aeronave": atyp,
-            "ADEP": adep,
-            "ADES": ades,
+            "Hora": hora, "ARCID": arcid, "Aeronave": atyp, "ADEP": adep, "ADES": ades,
             "prefix3": re.match(r'^[A-Z]{3}', arcid).group(0) if re.match(r'^[A-Z]{3}', arcid) else arcid[:3],
         })
     return pd.DataFrame(rows)
+
+
+def _parse_format2(raw_lines):
+    """Parses NM/CFMU-style detailed traffic lists, one flight per physical line,
+    where the airline code, status letters and flight number are all glued together
+    right after the HH:MM[A|E] time indicator, e.g.:
+    '06:44ALURSC5SKAT76ECMIFGCTSGCLP A09001-06:45+10:45 ...'
+    """
+    rows = []
+    for ln in raw_lines:
+        m = LINE_PAT_F2.match(ln)
+        if not m:
+            continue
+        hora, indicator, rest = m.group(1), m.group(2), m.group(3)
+        rest = rest.lstrip()
+
+        am = ATYP_PAT.search(rest)
+        if not am:
+            continue
+
+        prefix = rest[:am.start()]
+        atyp = am.group(1)
+        remainder = rest[am.end():]
+
+        dm = re.search(r'\d', prefix)
+        if dm:
+            alpha_run = prefix[:dm.start()]
+            digit_start = dm.start()
+        else:
+            alpha_run = prefix
+            digit_start = len(prefix)
+
+        airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
+        arcid = airline_code + prefix[digit_start:]
+
+        nospace_field = remainder.split(" ")[0]
+        adep = nospace_field[5:9]
+        ades = nospace_field[9:13]
+
+        rows.append({
+            "Hora": hora, "ARCID": arcid, "Aeronave": atyp, "ADEP": adep, "ADES": ades,
+            "prefix3": airline_code,
+        })
+    return pd.DataFrame(rows)
+
+
+def parse_pdf_flights(pdf_bytes):
+    """Extracts (Hora, ARCID, Aeronave, ADEP, ADES) from either of the two known
+    NOP/CFMU PDF traffic-list layouts, auto-detecting which one applies."""
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        raw_lines = []
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            raw_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
+
+    full_text = "\n".join(raw_lines)
+    if _looks_like_format2(full_text):
+        df = _parse_format2(raw_lines)
+    else:
+        df = _parse_format1(raw_lines)
+
+    return df
 
 
 def _load_sheet(xlsx_bytes, sheetname, max_col=60):
