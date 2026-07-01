@@ -38,7 +38,7 @@ run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx
 ATYP_PAT = re.compile(
     r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789|E295|E550|E190|E170|E175|E145|E135|CRJ9|CRJ7|CRJ2|BCS1|BCS3|SB20|F900|GLF6)'
 )
-TTV_PAT = re.compile(r'[A-Z]\d{3}\d{2}-')
+TTV_PAT = re.compile(r'[A-Z]\s?\d{3}\s?\d{2}-')
 
 # ICAO aircraft nationality (registration) prefixes -- used to reinsert the
 # hyphen in registrations that pdfplumber extracts without one, e.g. 'ECMIF' ->
