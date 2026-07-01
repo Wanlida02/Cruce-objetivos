@@ -38,6 +38,7 @@ run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx
 ATYP_PAT = re.compile(
     r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789)'
 )
+TTV_PAT = re.compile(r'[A-Z]\d{3}\d{2}-')
 
 # Format 1 (simple traffic list): "HH:MMA ARCID ATYP+REG+ADEP ADES" per physical line.
 TIME_PAT_F1 = re.compile(r'^(\d{2}:\d{2})A\s*(.*)$')
@@ -138,9 +139,27 @@ def _parse_one_flight_chunk(hora, rest):
     airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
     arcid = airline_code + prefix[digit_start:]
 
-    nospace_field = remainder.split(" ")[0]
-    adep = nospace_field[5:9]
-    ades = nospace_field[9:13]
+    # Locate the Traffic Volume anchor (e.g. "A390", "E370") immediately followed
+    # by the sequence number "NN-". pdfplumber sometimes inserts a stray space
+    # right before this anchor (and occasionally a ">" separator too) when the
+    # flight is an arrival, which breaks a fixed-offset character slice. Instead,
+    # take everything before the anchor, strip spaces/">" separators, and read
+    # the last 8 characters as ADEP(4)+ADES(4) -- this is robust regardless of
+    # whether pdfplumber fused the fields with or without a space.
+    anchor = TTV_PAT.search(remainder)
+    if anchor:
+        airport_block = remainder[:anchor.start()]
+    else:
+        airport_block = remainder.split(" ")[0]
+
+    airport_block = airport_block.replace(" ", "").replace(">", "")
+
+    if len(airport_block) >= 8:
+        adep = airport_block[-8:-4]
+        ades = airport_block[-4:]
+    else:
+        adep = airport_block[:4]
+        ades = airport_block[4:8]
 
     return {
         "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "ADEP": adep, "ADES": ades,
