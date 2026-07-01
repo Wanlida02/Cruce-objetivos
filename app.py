@@ -152,6 +152,22 @@ def _parse_format2(raw_lines):
     return pd.DataFrame(rows)
 
 
+EXPECTED_TOTAL_PAT = re.compile(r'-\s*(\d+)\s*Flights', re.IGNORECASE)
+
+
+def extract_expected_total(pdf_bytes):
+    """Reads the PDF header text (e.g. '... - 127 Flights') to know how many
+    flights the source system declares, so we can show a coverage indicator
+    versus how many we actually managed to parse."""
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            m = EXPECTED_TOTAL_PAT.search(txt)
+            if m:
+                return int(m.group(1))
+    return None
+
+
 def parse_pdf_flights(pdf_bytes):
     """Extracts (Hora, ARCID, Aeronave, ADEP, ADES) from either of the two known
     NOP/CFMU PDF traffic-list layouts, auto-detecting which one applies."""
@@ -424,6 +440,8 @@ if run:
         pdf_bytes = pdf_file.read()
         xlsx_bytes = xlsx_file.read()
 
+        expected_total = extract_expected_total(pdf_bytes)
+
         flights_df = parse_pdf_flights(pdf_bytes)
         if flights_df.empty:
             st.error("No se han podido extraer vuelos del PDF. Revisa que el formato sea el habitual de NOP Eurocontrol.")
@@ -435,20 +453,44 @@ if run:
         excel_buf = build_excel(result_df, fecha_str)
 
         # Persist results in session_state so that interacting with filter
-        # widgets afterwards (which also trigger a Streamlit rerun) does NOT
-        # discard the cross-reference results and force the user to click
-        # "Generar cruce" again.
+        # widgets, or downloading a file (which also triggers a Streamlit
+        # rerun / navigation on some browsers, e.g. inline PDF viewers),
+        # does NOT discard the cross-reference results and force the user
+        # to click "Generar cruce" again. session_state survives reruns
+        # within the same browser session/tab.
         st.session_state["result_df"] = result_df
         st.session_state["excel_buf"] = excel_buf.getvalue()
         st.session_state["fecha_str"] = fecha_str
+        st.session_state["expected_total"] = expected_total
 
 if "result_df" in st.session_state:
     result_df = st.session_state["result_df"]
     fecha_str = st.session_state["fecha_str"]
+    expected_total = st.session_state.get("expected_total")
     excel_buf = BytesIO(st.session_state["excel_buf"])
     pdf_buf = build_pdf(result_df, fecha_str)
 
+    # Anchor so that after opening a downloaded/printed PDF in a new tab
+    # (which some browsers do for inline PDF viewers), the user can click
+    # a link that scrolls straight back to the results table instead of
+    # having to regenerate the cross-reference.
+    st.markdown('<a name="resultados"></a>', unsafe_allow_html=True)
+
     st.success(f"Cruce completado: {len(result_df)} vuelos procesados.")
+
+    if expected_total:
+        detected = len(result_df)
+        pct = detected / expected_total * 100 if expected_total else 0
+        missing = max(expected_total - detected, 0)
+        if missing == 0:
+            st.info(f"✅ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). Coincide con el total declarado en el PDF.")
+        else:
+            st.warning(
+                f"⚠️ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). "
+                f"Faltan {missing} vuelo(s) por identificar; revisa manualmente el PDF original para esos casos."
+            )
+    else:
+        st.caption(f"No se ha podido leer el total declarado de vuelos en el PDF; se muestran los {len(result_df)} vuelos detectados.")
 
     counts = result_df["Tipo objetivo"].value_counts()
     cols = st.columns(len(counts) if len(counts) > 0 else 1)
