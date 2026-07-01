@@ -145,24 +145,40 @@ def _parse_one_flight_chunk(hora, rest):
     # flight is an arrival, which breaks a fixed-offset character slice. Instead,
     # take everything before the anchor, strip spaces/">" separators, and read
     # the last 8 characters as ADEP(4)+ADES(4) -- this is robust regardless of
-    # whether pdfplumber fused the fields with or without a space.
+    # whether pdfplumber fused the fields with or without a space. Everything
+    # BEFORE those last 8 characters is the aircraft registration (REG), which
+    # sits right after the aircraft type in the source table, e.g.
+    # "...AT76 EC-MIF GCTS GCLP..." -> reg block "ECMIF" -> "EC-MIF".
     anchor = TTV_PAT.search(remainder)
     if anchor:
-        airport_block = remainder[:anchor.start()]
+        reg_airport_block = remainder[:anchor.start()]
     else:
-        airport_block = remainder.split(" ")[0]
+        reg_airport_block = remainder.split(" ")[0]
 
-    airport_block = airport_block.replace(" ", "").replace(">", "")
+    reg_airport_block = reg_airport_block.replace(" ", "").replace(">", "")
 
-    if len(airport_block) >= 8:
-        adep = airport_block[-8:-4]
-        ades = airport_block[-4:]
+    if len(reg_airport_block) >= 8:
+        adep = reg_airport_block[-8:-4]
+        ades = reg_airport_block[-4:]
+        reg_raw = reg_airport_block[:-8]
     else:
-        adep = airport_block[:4]
-        ades = airport_block[4:8]
+        adep = reg_airport_block[:4]
+        ades = reg_airport_block[4:8]
+        reg_raw = ""
+
+    # Registrations follow the ICAO nationality-prefix format (1-2 letters,
+    # hyphen, up to 5 alphanumeric chars), e.g. "EC-MIF", "OE-IZF", "9H-QAD",
+    # "HB-JXP". Insert the hyphen after the recognised prefix length so it
+    # reads naturally; fall back to the raw text if it doesn't fit the pattern.
+    reg = reg_raw
+    if reg_raw:
+        rm = re.match(r'^([A-Z]{1,2}|[0-9][A-Z])([A-Z0-9]{1,5})$', reg_raw)
+        if rm:
+            reg = f"{rm.group(1)}-{rm.group(2)}"
 
     return {
-        "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "ADEP": adep, "ADES": ades,
+        "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "Matricula": reg,
+        "ADEP": adep, "ADES": ades,
         "prefix3": airline_code.strip(),
     }
 
@@ -399,6 +415,7 @@ def cross_reference(flights_df, icao_map, l1_map, l2_map, sana_map):
 
         out.append({
             "Hora": r["Hora"], "ARCID": r["ARCID"], "Aeronave": r["Aeronave"],
+            "Matricula": r.get("Matricula", ""),
             "ADEP": r["ADEP"], "ADES": r["ADES"], "Operador (maestro)": op,
             "Tipo objetivo": tipo, "Inspecciones realizadas": done, "Objetivo 2026": obj,
             "Restantes": rem, "Última inspección": last, "Fuente cruce": src,
@@ -412,11 +429,11 @@ def build_excel(df, fecha_str):
     ws.title = "Enriquecido"
     ws.column_dimensions["A"].width = 3
 
-    ws.merge_cells("B2:L2")
+    ws.merge_cells("B2:M2")
     ws["B2"] = f"GCTS - {fecha_str} - Lista de tráfico enriquecida con Objetivos SAFA/SACA/SANA"
     ws["B2"].font = Font(name="Calibri", size=14, bold=True, color="1F3864")
 
-    ws.merge_cells("B3:L3")
+    ws.merge_cells("B3:M3")
     ws["B3"] = "Cruce por ARCID (prefijo 3LC) contra Excel maestro Objetivos_SAFA_SACA_SANA_Matriculas."
     ws["B3"].font = Font(name="Calibri", size=9, italic=True, color="595959")
 
@@ -433,7 +450,7 @@ def build_excel(df, fecha_str):
     body_font = Font(name="Calibri", size=10)
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    centered = {"Hora", "ARCID", "Aeronave", "ADEP", "ADES", "Tipo objetivo",
+    centered = {"Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "Tipo objetivo",
                 "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección"}
 
     for i, row in df.iterrows():
@@ -451,7 +468,7 @@ def build_excel(df, fecha_str):
     last_col = 1 + len(headers)
     last_col_letter = get_column_letter(last_col)
 
-    widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "ADEP": 8, "ADES": 8,
+    widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "Matricula": 12, "ADEP": 8, "ADES": 8,
               "Operador (maestro)": 42, "Tipo objetivo": 14, "Inspecciones realizadas": 12,
               "Objetivo 2026": 12, "Restantes": 10, "Última inspección": 16, "Fuente cruce": 20}
     for j, h in enumerate(headers, start=2):
