@@ -40,6 +40,29 @@ ATYP_PAT = re.compile(
 )
 TTV_PAT = re.compile(r'[A-Z]\d{3}\d{2}-')
 
+# ICAO aircraft nationality (registration) prefixes -- used to reinsert the
+# hyphen in registrations that pdfplumber extracts without one, e.g. 'ECMIF' ->
+# 'EC-MIF', 'GEUXE' -> 'G-EUXE'. Sorted longest-first so 2-letter prefixes
+# (e.g. 'EC', 'EI', 'OE') are tried before 1-letter ones (e.g. 'G', 'D', 'F')
+# to avoid misreading a 2-letter-prefix registration as a 1-letter one.
+REG_PREFIXES = [
+    # 2-letter / 2-char ICAO nationality prefixes (checked first, longest match wins)
+    '9H', '9M', '9V', '9A', '9K', '9G', '4X', '4R', '4L',
+    'HB', 'HA', 'HS', 'HL', 'HK', 'HP', 'HZ',
+    'LX', 'LY', 'LZ', 'LV', 'LN',
+    'EC', 'EI', 'EK', 'EP', 'ES', 'ET', 'EW', 'EY',
+    'OE', 'OO', 'OY', 'OH', 'OK', 'OM', 'OB',
+    'PH', 'PK', 'PP', 'PR', 'PT', 'PZ',
+    'SE', 'SP', 'ST', 'SU', 'SX',
+    'TC', 'TF', 'TG', 'TJ', 'TN', 'TR', 'TS', 'TU', 'TY', 'TZ',
+    'UK', 'UR', 'VH', 'VN', 'VP', 'VQ', 'VT',
+    'XA', 'XB', 'XC', 'YI', 'YJ', 'YK', 'YL', 'YR', 'YU', 'YV',
+    'ZA', 'ZK', 'ZP', 'ZS', 'CN', 'CS', 'CC', 'CP', 'CU', 'CX',
+    # 1-letter prefixes (checked only if no 2-letter prefix matched)
+    'G', 'D', 'F', 'N', 'B', 'I', 'J', 'H', 'P', 'V', 'Z', 'C',
+]
+REG_PREFIXES_SORTED = sorted(set(REG_PREFIXES), key=len, reverse=True)
+
 # Format 1 (simple traffic list): "HH:MMA ARCID ATYP+REG+ADEP ADES" per physical line.
 TIME_PAT_F1 = re.compile(r'^(\d{2}:\d{2})A\s*(.*)$')
 FLIGHT_LINE_PAT_F1 = re.compile(r'^\d{2}:\d{2}A')
@@ -172,9 +195,10 @@ def _parse_one_flight_chunk(hora, rest):
     # reads naturally; fall back to the raw text if it doesn't fit the pattern.
     reg = reg_raw
     if reg_raw:
-        rm = re.match(r'^([A-Z]{1,2}|[0-9][A-Z])([A-Z0-9]{1,5})$', reg_raw)
-        if rm:
-            reg = f"{rm.group(1)}-{rm.group(2)}"
+        for p in REG_PREFIXES_SORTED:
+            if reg_raw.startswith(p) and len(reg_raw) - len(p) >= 2:
+                reg = f"{p}-{reg_raw[len(p):]}"
+                break
 
     return {
         "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "Matricula": reg,
