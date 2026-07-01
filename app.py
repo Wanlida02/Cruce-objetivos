@@ -36,7 +36,7 @@ with col2:
 run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
 
 ATYP_PAT = re.compile(
-    r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789)'
+    r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789|E295|E550|E190|E170|E175|E145|E135|CRJ9|CRJ7|CRJ2|BCS1|BCS3|SB20|F900|GLF6)'
 )
 TTV_PAT = re.compile(r'[A-Z]\d{3}\d{2}-')
 
@@ -51,7 +51,7 @@ FLIGHT_LINE_PAT_F1 = re.compile(r'^\d{2}:\d{2}A')
 # original PDF table. FLIGHT_START_PAT_F2 is used with finditer (not a line-anchored match) so
 # every occurrence of "HH:MM[A|E|C]" inside a fused chunk of text is found and parsed separately,
 # instead of only the first one on that physical line.
-FLIGHT_START_PAT_F2 = re.compile(r'(\d{2}:\d{2})([AEC])')
+FLIGHT_START_PAT_F2 = re.compile(r'(\d{2}:\d{2})([AEC])(?=\s?(?:[A-Z]{1,4}\s?)?[A-Z]{2,4}\d)')
 
 
 def _looks_like_format2(text_sample):
