@@ -613,7 +613,9 @@ if "result_df" in st.session_state:
         ades_disponibles = sorted(
             [a for a in result_df["ADES"].dropna().unique().tolist() if a]
         )
-        ades_sel = st.multiselect("ADES (destino)", ades_disponibles, default=[])
+        incluir_ades_vacios = result_df["ADES"].isna().any() or (result_df["ADES"] == "").any()
+        opciones_ades = (["(vacío)"] if incluir_ades_vacios else []) + ades_disponibles
+        ades_sel = st.multiselect("ADES (destino)", opciones_ades, default=[])
     with fcol3:
         operadores_disponibles = sorted(
             [o for o in result_df["Operador (maestro)"].dropna().unique().tolist() if o]
@@ -638,9 +640,22 @@ if "result_df" in st.session_state:
             min_fecha, max_fecha = fechas_validas.min().date(), fechas_validas.max().date()
         else:
             min_fecha = max_fecha = datetime.now().date()
-        fecha_range = st.date_input(
-            "Última inspección (rango)", value=(min_fecha, max_fecha)
-        )
+
+        preset_opciones = [
+            "Todas las fechas",
+            "Última semana",
+            "Último mes",
+            "No en la última semana",
+            "No en el último mes",
+            "Rango personalizado",
+        ]
+        preset_sel = st.selectbox("Última inspección", preset_opciones, index=0)
+
+        fecha_range = None
+        if preset_sel == "Rango personalizado":
+            fecha_range = st.date_input(
+                "Rango personalizado de fechas", value=(min_fecha, max_fecha)
+            )
 
     filtered_df = result_df.copy()
     if texto_busqueda.strip():
@@ -648,7 +663,12 @@ if "result_df" in st.session_state:
             filtered_df["ARCID"].str.contains(texto_busqueda.strip(), case=False, na=False)
         ]
     if ades_sel:
-        filtered_df = filtered_df[filtered_df["ADES"].isin(ades_sel)]
+        quiere_vacios = "(vacío)" in ades_sel
+        valores_reales = [a for a in ades_sel if a != "(vacío)"]
+        mask_ades = filtered_df["ADES"].isin(valores_reales)
+        if quiere_vacios:
+            mask_ades = mask_ades | filtered_df["ADES"].isna() | (filtered_df["ADES"] == "")
+        filtered_df = filtered_df[mask_ades]
     if operadores_sel:
         filtered_df = filtered_df[filtered_df["Operador (maestro)"].isin(operadores_sel)]
     if tipos_sel:
@@ -659,12 +679,31 @@ if "result_df" in st.session_state:
         rest_num_full.isna() | rest_num_full.between(restantes_range[0], restantes_range[1])
     ]
 
-    if isinstance(fecha_range, tuple) and len(fecha_range) == 2:
-        fechas_filtro = pd.to_datetime(filtered_df["Última inspección"], errors="coerce")
+    hoy = datetime.now().date()
+    fechas_filtro = pd.to_datetime(filtered_df["Última inspección"], errors="coerce")
+
+    if preset_sel == "Última semana":
+        limite = hoy - pd.Timedelta(days=7)
+        mask_fecha = fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)
+        filtered_df = filtered_df[mask_fecha]
+    elif preset_sel == "Último mes":
+        limite = hoy - pd.Timedelta(days=30)
+        mask_fecha = fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)
+        filtered_df = filtered_df[mask_fecha]
+    elif preset_sel == "No en la última semana":
+        limite = hoy - pd.Timedelta(days=7)
+        mask_fecha = fechas_filtro.isna() | (fechas_filtro.dt.date < limite)
+        filtered_df = filtered_df[mask_fecha]
+    elif preset_sel == "No en el último mes":
+        limite = hoy - pd.Timedelta(days=30)
+        mask_fecha = fechas_filtro.isna() | (fechas_filtro.dt.date < limite)
+        filtered_df = filtered_df[mask_fecha]
+    elif preset_sel == "Rango personalizado" and isinstance(fecha_range, tuple) and len(fecha_range) == 2:
         mask_fecha = fechas_filtro.isna() | (
             (fechas_filtro.dt.date >= fecha_range[0]) & (fechas_filtro.dt.date <= fecha_range[1])
         )
         filtered_df = filtered_df[mask_fecha]
+    # "Todas las fechas" -> no additional filtering
 
     st.caption(f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros.")
     st.dataframe(filtered_df, use_container_width=True, height=500)
