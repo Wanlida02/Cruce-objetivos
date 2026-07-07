@@ -36,7 +36,7 @@ with col2:
 run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
 
 ATYP_PAT = re.compile(
-    r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A350|A330|T380|A380|A300|A306|B772|B763|B788|B789|E295|E550|E190|E170|E175|E145|E135|CRJ9|CRJ7|CRJ2|BCS1|BCS3|SB20|F900|GLF6)'
+    r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A333|A350|A330|A339|T380|A380|A300|A306|B772|B763|B764|B788|B789|B748|B77L|E295|E550|E190|E170|E175|E145|E135|CRJ9|CRJ7|CRJ2|CRJX|BCS1|BCS3|SB20|F900|GLF6)'
 )
 TTV_PAT = re.compile(r'[A-Z]\s?\d{3}\s?\d{2}-')
 
@@ -176,11 +176,20 @@ def _parse_one_flight_chunk(hora, rest):
     if anchor:
         reg_airport_block = remainder[:anchor.start()]
     else:
-        reg_airport_block = remainder.split(" ")[0]
+        reg_airport_block = remainder
 
     reg_airport_block = reg_airport_block.replace(" ", "").replace(">", "")
 
-    if len(reg_airport_block) >= 8:
+    m_airports = list(re.finditer(r'[A-Z]{4}', reg_airport_block))
+    if len(m_airports) >= 2:
+        adep = m_airports[-2].group(0)
+        ades = m_airports[-1].group(0)
+        reg_raw = reg_airport_block[:m_airports[-2].start()]
+    elif len(reg_airports := m_airports) == 1:
+        adep = reg_airport_block[:4]
+        ades = reg_airport_block[4:8]
+        reg_raw = reg_airport_block[8:m_airports[0].start()] if m_airports[0].start() >= 8 else ""
+    elif len(reg_airport_block) >= 8:
         adep = reg_airport_block[-8:-4]
         ades = reg_airport_block[-4:]
         reg_raw = reg_airport_block[:-8]
