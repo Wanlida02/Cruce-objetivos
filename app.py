@@ -50,26 +50,109 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 
 st.set_page_config(page_title="GCTS - Cruce Objetivos SAFA/SACA/SANA", layout="wide")
 
-st.title("Cruce automÃ¡tico: Lista de trÃ¡fico (NOP) + Objetivos SAFA/SACA/SANA")
+st.title("Cruce automático: Lista de tráfico (NOP) + Objetivos SAFA/SACA/SANA")
 st.caption(
-    "Sube el PDF de la lista de trÃ¡fico (NOP Eurocontrol, formato ARCID) y el Excel maestro "
-    "de Objetivos SAFA/SACA/SANA/MatrÃ­culas. La app cruza cada vuelo por el prefijo ARCID (3 letras) "
+    "Sube el PDF de la lista de tráfico (NOP Eurocontrol, formato ARCID) y el Excel maestro "
+    "de Objetivos SAFA/SACA/SANA/Matrículas. La app cruza cada vuelo por el prefijo ARCID (3 letras) "
     "y genera un Excel y un PDF enriquecidos con Tipo de objetivo, inspecciones realizadas, "
-    "objetivo 2026, restantes y Ãºltima inspecciÃ³n."
+    "objetivo 2026, restantes y última inspección."
 )
 
 col1, col2 = st.columns(2)
 with col1:
-    pdf_file = st.file_uploader("1. PDF de trÃ¡fico (NOP / ARCID)", type=["pdf"])
+    pdf_file = st.file_uploader("1. PDF de tráfico (NOP / ARCID)", type=["pdf"])
 with col2:
     xlsx_file = st.file_uploader("2. Excel maestro (Objetivos SAFA/SACA/SANA)", type=["xlsx"])
 
 run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
 
+# ATYP_PAT is a HINT used to disambiguate ARCID parsing, never a mandatory gate
+# that drops a flight when it doesn't match. Real NOP traffic mixes airliners
+# with a huge variety of business/regional aircraft (Citation, Falcon, Pilatus,
+# Learjet, helicopters, etc.), and a closed whitelist can never keep up -- every
+# new NOP export tends to surface a type that's missing, silently losing flights.
+# It's expanded generously here to maximise disambiguation accuracy, but the
+# generic-shape fallback below (looks_like_type / GENERIC_TYPE_PAT) guarantees
+# unrecognised types still get parsed instead of dropped.
 ATYP_PAT = re.compile(
-    r'(DA42|A20N|A21N|A320|A321|A319|AT76|B738|B38M|C680|A332|A333|A350|A330|A339|T380|A380|A300|A306|B772|B763|B764|B788|B789|B748|B77L|E295|E550|E190|E170|E175|E145|E135|CRJ9|CRJ7|CRJ2|CRJX|BCS1|BCS3|SB20|F900|GLF6)'
+    r'(DA42|A20N|A21N|A320|A321|A319|A318|AT76|AT75|AT72|B738|B737|B739|B38M|B39M|B37M|'
+    r'C680|C68A|C56X|C525|C550|C25A|C25B|C25C|C25M|C650|C500|C510|C560|'
+    r'A332|A333|A342|A343|A345|A346|A350|A359|A35K|A330|A339|T380|A380|A300|A306|'
+    r'B772|B773|B77L|B77W|B763|B764|B762|B788|B789|B78X|B748|B744|B742|B734|B735|B736|'
+    r'E295|E290|E195|E190|E170|E175|E145|E135|E50P|E545|E550|E55P|'
+    r'CRJ9|CRJ7|CRJ2|CRJX|BCS1|BCS3|SB20|SF34|'
+    r'F900|F2TH|FA7X|FA8X|F7X|GLF4|GLF5|GLF6|GL5T|GL7T|G280|G150|G200|'
+    r'LJ35|LJ40|LJ45|LJ60|LJ70|LJ75|H25B|H25C|CL30|CL35|CL60|CL604|CL605|'
+    r'PC12|PC24|TBM7|TBM8|TBM9|BE20|BE9L|BE40|R44|R66|EC20|EC30|EC35|EC45|AS50|AS55|A139|A109|'
+    r'GLEX|GLF|DHC6|DHC8|SW4|MU2|PA46|PA28|PA31|SR22|SR20|C172|C182|C206|C210|C340|C414|P28U|P180|P68)'
 )
-TTV_PAT = re.compile(r'[A-Z]\s?\d{3}\s?\d{2}-')
+
+# Generic ICAO aircraft-type SHAPE check (used only as a fallback when ATYP_PAT
+# doesn't recognise the token): real designators are 2-4 alphanumeric chars,
+# start with a letter, and normally contain at least one digit.
+GENERIC_TYPE_PAT = re.compile(r'^[A-Z][A-Z0-9]{2,3}')
+
+def _looks_like_type(tok):
+    if not tok:
+        return False
+    for length in (4, 3):
+        cand = tok[:length]
+        if len(cand) == length and re.match(r'^[A-Z][A-Z0-9]{2,3}$', cand) and re.search(r'\d', cand):
+            return True
+    return False
+
+# ARCID (call sign) base shape: 2-4 letter airline/operator code + 1-4 digit
+# flight number, with an OPTIONAL trailing single letter (radar-label suffix,
+# e.g. the "S" in "GES322S" or the "R" in "NJE918R"). Anchoring on this fixed
+# shape is far more reliable than anchoring on aircraft type, because ARCID
+# always follows it while aircraft type designators are extremely varied.
+ARCID_BASE_PAT = re.compile(r'^([A-Z]{2,4}\d{1,4})([A-Z]{0,2})')
+
+def _resolve_arcid(chunk):
+    """Splits the ARCID off the front of `chunk` using two strategies, tried
+    in order:
+
+    1. REAL SPACE SEPARATOR (most reliable, ~90% of NOP rows): if the source
+       PDF text has an actual space between the ARCID and what follows (e.g.
+       'GES322S C56XECMSS ...'), and the token before that space matches the
+       ARCID shape, use it directly -- no ambiguity possible.
+
+    2. GLUED FALLBACK (~10% of rows, e.g. 'IBE03CYA333ECLUB...' or
+       'EZY43WRA319GEZAJ...'): ARCID's trailing radar-label suffix can be
+       ZERO, ONE, or TWO letters, and there is no fixed-width rule to know
+       which -- it depends on what immediately follows. We try all three
+       suffix lengths (2, 1, 0 letters) and pick the LONGEST one whose
+       remainder is a recognised aircraft-type token (checked first against
+       ATYP_PAT's known designators, then against the generic ICAO-type
+       SHAPE as a fallback for unlisted types). Preferring the longest valid
+       split avoids leaving stray suffix letters glued onto the type/
+       registration block, which corrupts every downstream field.
+
+    Returns (arcid, remainder_after_arcid) or (None, chunk) if no ARCID-shaped
+    token is found at all.
+    """
+    sp = chunk.find(' ')
+    if sp != -1 and 2 <= sp <= 8:
+        candidate = chunk[:sp]
+        if re.match(r'^[A-Z]{2,4}\d{1,4}[A-Z]{0,2}$', candidate):
+            return candidate, chunk[sp + 1:]
+
+    m = ARCID_BASE_PAT.match(chunk)
+    if not m:
+        return None, chunk
+    base = m.group(1)
+    full_suffix = m.group(2)
+    candidates = [(full_suffix[:L], chunk[len(base) + L:]) for L in range(len(full_suffix), -1, -1)]
+
+    for suf, rest in candidates:
+        if ATYP_PAT.match(rest):
+            return base + suf, rest
+    for suf, rest in candidates:
+        if _looks_like_type(rest):
+            return base + suf, rest
+    return base, chunk[len(base):]
+
+TTV_PAT = re.compile(r'[A-Za-z]\s?\d{3}\s?\d{2}-')
 
 # ICAO aircraft nationality (registration) prefixes -- used to reinsert the
 # hyphen in registrations that pdfplumber extracts without one, e.g. 'ECMIF' ->
@@ -81,7 +164,7 @@ REG_PREFIXES = [
     '9H', '9M', '9V', '9A', '9K', '9G', '4X', '4R', '4L',
     'HB', 'HA', 'HS', 'HL', 'HK', 'HP', 'HZ',
     'LX', 'LY', 'LZ', 'LV', 'LN',
-    'EC', 'EI', 'EK', 'EP', 'ES', 'ET', 'EW', 'EY',
+    'EC', 'EI', 'EK', 'EP', 'ER', 'ES', 'ET', 'EW', 'EY',
     'OE', 'OO', 'OY', 'OH', 'OK', 'OM', 'OB',
     'PH', 'PK', 'PP', 'PR', 'PT', 'PZ',
     'SE', 'SP', 'ST', 'SU', 'SX',
@@ -89,6 +172,7 @@ REG_PREFIXES = [
     'UK', 'UR', 'VH', 'VN', 'VP', 'VQ', 'VT',
     'XA', 'XB', 'XC', 'YI', 'YJ', 'YK', 'YL', 'YR', 'YU', 'YV',
     'ZA', 'ZK', 'ZP', 'ZS', 'CN', 'CS', 'CC', 'CP', 'CU', 'CX',
+    'A7', 'A6', 'A9', 'A4', '7T', '4X', 'JY',
     # 1-letter prefixes (checked only if no 2-letter prefix matched)
     'G', 'D', 'F', 'N', 'B', 'I', 'J', 'H', 'P', 'V', 'Z', 'C',
 ]
@@ -169,6 +253,47 @@ def _parse_format1(raw_lines):
 CURRENT_PDF_ICAOS = set()
 
 def _extract_reg_airports(block):
+    """Splits `block` (everything between the aircraft type and the Traffic
+    Volume anchor) into (registration, ADEP, ADES).
+
+    STRATEGY: prefer REAL SPACES from the source PDF text as the separator --
+    they are the most reliable signal available, and work regardless of which
+    registration format is in play (European 'EC-MIF', Gulf 'A7-BHS'/'A6-EEI',
+    US N-numbers 'N76064', African '7T-VKH', etc. -- these differ wildly in
+    shape, so anchoring on registration shape is fragile, but the space before
+    an ICAO airport code is consistently present whenever pdfplumber preserved
+    it). We pop the last 1-2 whitespace-separated ICAO-shaped (4 pure letters)
+    tokens off the end as ADES/ADEP; if the airport code is glued to the
+    registration with no space (still common at the ADEP/registration
+    boundary), we peel the trailing 4 letters off that same token instead of
+    requiring a space there too.
+
+    Falls back to the old whitelist/last-two-4-letter-blocks/fixed-8-char
+    approach only when nothing in the block looks like a spaced-off or
+    trailing 4-letter airport code at all (fully glued edge case).
+    """
+    tokens = block.split()
+
+    def _pop_airport(toks):
+        if not toks:
+            return None
+        t = toks[-1]
+        if len(t) == 4 and t.isalpha():
+            toks.pop()
+            return t
+        if len(t) > 4 and t[-4:].isalpha():
+            toks[-1] = t[:-4]
+            return t[-4:]
+        return None
+
+    toks = tokens[:]
+    ades = _pop_airport(toks)
+    adep = _pop_airport(toks) if ades else None
+
+    if ades and adep:
+        reg_raw = "".join(toks)
+        return reg_raw, adep, ades
+
     compact = block.replace(" ", "").replace(">", "")
     if not compact:
         return "", "", ""
@@ -193,50 +318,81 @@ def _parse_one_flight_chunk(hora, rest):
     flights that pdfplumber may have fused onto the same physical line) starting
     right after the HH:MM[A|E|C] indicator, e.g.:
     'LU RSC5SK AT76 EC-MIF GCTS GCLP A090 01-06:45+10:45 06:55E fI 06:44aT  10 N    N'
+
+    STRATEGY (whitelist-free, position/shape based): ARCID always sits at the
+    very start of this chunk and always follows the fixed shape
+    LETTERS+DIGITS(+optional trailing letter), e.g. 'IBE5105', 'GES322S'.
+    We anchor on that shape first (via _resolve_arcid) instead of on aircraft
+    type, because ARCID shape is fixed while aircraft type designators are
+    extremely varied (airliners, regional types, and a huge range of business
+    jets/helicopters) and can never be fully covered by a closed whitelist.
+    Once the ARCID is split off, the aircraft type is read from the immediate
+    remainder using ATYP_PAT as a hint, falling back to a generic ICAO-type
+    SHAPE match (letter + 2-3 alphanumeric chars) so unrecognised types are
+    still captured instead of causing the whole flight to be dropped.
     """
     rest = rest.lstrip()
 
-    am = ATYP_PAT.search(rest)
-    if not am:
-        return None
-
-    prefix = rest[:am.start()]
-    atyp = am.group(1)
-    remainder = rest[am.end():]
-
-    dm = re.search(r'\d', prefix)
-    if dm:
-        alpha_run = prefix[:dm.start()]
-        digit_start = dm.start()
+    arcid, after_arcid = _resolve_arcid(rest)
+    if arcid is None:
+        # Chunk doesn't start with an ARCID-shaped token at all (rare noise
+        # from pdfplumber) -- fall back to the old aircraft-type-anchored
+        # approach as a last resort.
+        am = ATYP_PAT.search(rest)
+        if not am:
+            return None
+        prefix = rest[:am.start()]
+        atyp = am.group(1)
+        remainder = rest[am.end():]
+        dm = re.search(r'\d', prefix)
+        alpha_run = prefix[:dm.start()] if dm else prefix
+        digit_start = dm.start() if dm else len(prefix)
+        airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
+        arcid = airline_code + prefix[digit_start:]
     else:
-        alpha_run = prefix
-        digit_start = len(prefix)
+        letters_m = re.match(r'^[A-Z]+', arcid)
+        airline_code = letters_m.group(0)[-3:] if letters_m else arcid[:3]
 
-    airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
-    arcid = airline_code + prefix[digit_start:]
+        # Locate the Traffic Volume anchor (e.g. "A390 01-") to isolate the
+        # ATYP+REG+ADEP+ADES block from everything that follows (times, flags).
+        anchor = TTV_PAT.search(after_arcid)
+        block = after_arcid[:anchor.start()] if anchor else after_arcid
+        block = block.lstrip()
 
-    # Locate the Traffic Volume anchor (e.g. "A390", "E370") immediately followed
-    # by the sequence number "NN-". pdfplumber sometimes inserts a stray space
-    # right before this anchor (and occasionally a ">" separator too) when the
-    # flight is an arrival, which breaks a fixed-offset character slice. Instead,
-    # take everything before the anchor, strip spaces/">" separators, and read
-    # the last 8 characters as ADEP(4)+ADES(4) -- this is robust regardless of
-    # whether pdfplumber fused the fields with or without a space. Everything
-    # BEFORE those last 8 characters is the aircraft registration (REG), which
-    # sits right after the aircraft type in the source table, e.g.
-    # "...AT76 EC-MIF GCTS GCLP..." -> reg block "ECMIF" -> "EC-MIF".
+        # Read the aircraft type off the front of the block: prefer ATYP_PAT
+        # (known designator) but fall back to the generic ICAO-type shape
+        # (letter + 2-3 alphanumeric chars, e.g. 'A359', 'C56X', 'PC24',
+        # 'F2TH') so unrecognised business-jet/regional types are still
+        # captured rather than causing the flight to be silently dropped.
+        atyp = ""
+        am = ATYP_PAT.match(block)
+        if am:
+            atyp = am.group(1)
+            remainder = block[am.end():]
+        else:
+            gm = GENERIC_TYPE_PAT.match(block)
+            if gm:
+                atyp = gm.group(0)
+                remainder = block[gm.end():]
+            else:
+                remainder = block
+
+        anchor2 = TTV_PAT.search(remainder)
+        reg_airport_block = remainder[:anchor2.start()] if anchor2 else remainder
+
+        reg_raw, adep, ades = _extract_reg_airports(reg_airport_block)
+        reg = _choose_best_reg(reg_raw) if reg_raw else ''
+
+        return {
+            "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "Matricula": reg,
+            "ADEP": adep, "ADES": ades,
+            "prefix3": airline_code.strip(),
+        }
+
+    # Legacy fallback path (ARCID_BASE_PAT didn't match at all).
     anchor = TTV_PAT.search(remainder)
-    if anchor:
-        reg_airport_block = remainder[:anchor.start()]
-    else:
-        reg_airport_block = remainder
-
+    reg_airport_block = remainder[:anchor.start()] if anchor else remainder
     reg_raw, adep, ades = _extract_reg_airports(reg_airport_block)
-
-    # Registrations follow the ICAO nationality-prefix format (1-2 letters,
-    # hyphen, up to 5 alphanumeric chars), e.g. "EC-MIF", "OE-IZF", "9H-QAD",
-    # "HB-JXP". Insert the hyphen after the recognised prefix length so it
-    # reads naturally; fall back to the raw text if it doesn't fit the pattern.
     reg = _choose_best_reg(reg_raw) if reg_raw else ''
 
     return {
@@ -306,14 +462,9 @@ def extract_raw_arcid_candidates(pdf_bytes):
                 chunk_start = m.end()
                 chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
                 chunk = ln[chunk_start:chunk_end].lstrip()
-                am = ATYP_PAT.search(chunk)
-                prefix = chunk[:am.start()] if am else chunk[:12]
-                dm = re.search(r'\d', prefix)
-                alpha_run = prefix[:dm.start()] if dm else prefix
-                digit_start = dm.start() if dm else len(prefix)
-                airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
-                arcid_guess = airline_code + prefix[digit_start:]
-                candidates.append({"Hora": hora, "ARCID_guess": arcid_guess.strip(), "parsed_ok": am is not None})
+                parsed = _parse_one_flight_chunk(hora, chunk)
+                arcid_guess = parsed["ARCID"] if parsed else chunk[:12]
+                candidates.append({"Hora": hora, "ARCID_guess": arcid_guess.strip(), "parsed_ok": parsed is not None})
         return pd.DataFrame(candidates)
     else:
         merged = []
@@ -481,7 +632,7 @@ def cross_reference(flights_df, icao_map, l1_map, l2_map, sana_map):
             "Matricula": r.get("Matricula", ""),
             "ADEP": r["ADEP"], "ADES": r["ADES"], "Operador (maestro)": op,
             "Tipo objetivo": tipo, "Inspecciones realizadas": done, "Objetivo 2026": obj,
-            "Restantes": rem, "Ãšltima inspecciÃ³n": last, "Fuente cruce": src,
+            "Restantes": rem, "Última inspección": last, "Fuente cruce": src,
         })
     return pd.DataFrame(out)
 
@@ -493,7 +644,7 @@ def build_excel(df, fecha_str):
     ws.column_dimensions["A"].width = 3
 
     ws.merge_cells("B2:M2")
-    ws["B2"] = f"GCTS - {fecha_str} - Lista de trÃ¡fico enriquecida con Objetivos SAFA/SACA/SANA"
+    ws["B2"] = f"GCTS - {fecha_str} - Lista de tráfico enriquecida con Objetivos SAFA/SACA/SANA"
     ws["B2"].font = Font(name="Calibri", size=14, bold=True, color="1F3864")
 
     ws.merge_cells("B3:M3")
@@ -514,7 +665,7 @@ def build_excel(df, fecha_str):
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     centered = {"Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "Tipo objetivo",
-                "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Ãšltima inspecciÃ³n"}
+                "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección"}
 
     for i, row in df.iterrows():
         r = header_row + 1 + i
@@ -533,7 +684,7 @@ def build_excel(df, fecha_str):
 
     widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "Matricula": 12, "ADEP": 8, "ADES": 8,
               "Operador (maestro)": 42, "Tipo objetivo": 14, "Inspecciones realizadas": 12,
-              "Objetivo 2026": 12, "Restantes": 10, "Ãšltima inspecciÃ³n": 16, "Fuente cruce": 20}
+              "Objetivo 2026": 12, "Restantes": 10, "Última inspección": 16, "Fuente cruce": 20}
     for j, h in enumerate(headers, start=2):
         ws.column_dimensions[get_column_letter(j)].width = widths.get(h, 14)
 
@@ -563,10 +714,10 @@ def build_pdf(df, fecha_str):
     styles.add(ParagraphStyle(name="T", fontName="Helvetica", fontSize=5.6, leading=6.0))
 
     headers = ["Hora", "ARCID", "Aeronave", "ADEP", "ADES", "Operador maestro",
-               "Tipo objetivo", "Realiz.", "Objetivo", "Rest.", "Ãšltima inspecciÃ³n", "Fuente"]
+               "Tipo objetivo", "Realiz.", "Objetivo", "Rest.", "Última inspección", "Fuente"]
 
     parts = [
-        Paragraph(f"GCTS {fecha_str} - PDF reconstruido con columnas aÃ±adidas", styles["Title"]),
+        Paragraph(f"GCTS {fecha_str} - PDF reconstruido con columnas añadidas", styles["Title"]),
         Spacer(1, 4),
         Paragraph("Cruce principal por prefijo ARCID (3 letras) con Excel maestro.", styles["S"]),
         Spacer(1, 6),
@@ -585,7 +736,7 @@ def build_pdf(df, fecha_str):
                 "" if pd.isna(x["Inspecciones realizadas"]) else str(x["Inspecciones realizadas"]),
                 "" if pd.isna(x["Objetivo 2026"]) else str(x["Objetivo 2026"]),
                 "" if pd.isna(x["Restantes"]) else str(x["Restantes"]),
-                str(x["Ãšltima inspecciÃ³n"])[:16], x["Fuente cruce"],
+                str(x["Última inspección"])[:16], x["Fuente cruce"],
             ])
         t = Table(data, colWidths=col_widths, repeatRows=1)
         t.setStyle(TableStyle([
@@ -665,10 +816,10 @@ if "result_df" in st.session_state:
         pct = detected / expected_total * 100 if expected_total else 0
         missing = max(expected_total - detected, 0)
         if missing == 0:
-            st.info(f"âœ… Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). Coincide con el total declarado en el PDF.")
+            st.info(f"✅ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). Coincide con el total declarado en el PDF.")
         else:
             st.warning(
-                f"âš ï¸ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). "
+                f"⚠️ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). "
                 f"Faltan {missing} vuelo(s) por identificar; revisa manualmente el PDF original para esos casos."
             )
 
@@ -691,9 +842,9 @@ if "result_df" in st.session_state:
                         use_container_width=True,
                     )
                     st.caption(
-                        "Estos vuelos aparecen en el texto extraÃ­do del PDF (marcador de hora + indicador A/E/C) "
+                        "Estos vuelos aparecen en el texto extraído del PDF (marcador de hora + indicador A/E/C) "
                         "pero no llegaron a la tabla final, normalmente porque el tipo de aeronave no coincide con "
-                        "los cÃ³digos reconocidos (ATYP_PAT) o porque el bloque de texto quedÃ³ incompleto."
+                        "los códigos reconocidos (ATYP_PAT) o porque el bloque de texto quedó incompleto."
                     )
     else:
         st.caption(f"No se ha podido leer el total declarado de vuelos en el PDF; se muestran los {len(result_df)} vuelos detectados.")
@@ -713,7 +864,7 @@ if "result_df" in st.session_state:
             [a for a in result_df["ADES"].dropna().unique().tolist() if a]
         )
         incluir_ades_vacios = result_df["ADES"].isna().any() or (result_df["ADES"] == "").any()
-        opciones_ades = (["(vacÃ­o)"] if incluir_ades_vacios else []) + ades_disponibles
+        opciones_ades = (["(vacío)"] if incluir_ades_vacios else []) + ades_disponibles
         ades_sel = st.multiselect("ADES (destino)", opciones_ades, default=[])
     with fcol3:
         operadores_disponibles = sorted(
@@ -734,7 +885,7 @@ if "result_df" in st.session_state:
             "Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1))
         )
     with fcol6:
-        fechas_validas = pd.to_datetime(result_df["Ãšltima inspecciÃ³n"], errors="coerce")
+        fechas_validas = pd.to_datetime(result_df["Última inspección"], errors="coerce")
         if fechas_validas.notna().any():
             min_fecha, max_fecha = fechas_validas.min().date(), fechas_validas.max().date()
         else:
@@ -742,13 +893,13 @@ if "result_df" in st.session_state:
 
         preset_opciones = [
             "Todas las fechas",
-            "Ãšltima semana",
-            "Ãšltimo mes",
-            "No en la Ãºltima semana",
-            "No en el Ãºltimo mes",
+            "Última semana",
+            "Último mes",
+            "No en la última semana",
+            "No en el último mes",
             "Rango personalizado",
         ]
-        preset_sel = st.selectbox("Ãšltima inspecciÃ³n", preset_opciones, index=0)
+        preset_sel = st.selectbox("Última inspección", preset_opciones, index=0)
 
         fecha_range = None
         if preset_sel == "Rango personalizado":
@@ -762,8 +913,8 @@ if "result_df" in st.session_state:
             filtered_df["ARCID"].str.contains(texto_busqueda.strip(), case=False, na=False)
         ]
     if ades_sel:
-        quiere_vacios = "(vacÃ­o)" in ades_sel
-        valores_reales = [a for a in ades_sel if a != "(vacÃ­o)"]
+        quiere_vacios = "(vacío)" in ades_sel
+        valores_reales = [a for a in ades_sel if a != "(vacío)"]
         mask_ades = filtered_df["ADES"].isin(valores_reales)
         if quiere_vacios:
             mask_ades = mask_ades | filtered_df["ADES"].isna() | (filtered_df["ADES"] == "")
@@ -779,21 +930,21 @@ if "result_df" in st.session_state:
     ]
 
     hoy = datetime.now().date()
-    fechas_filtro = pd.to_datetime(filtered_df["Ãšltima inspecciÃ³n"], errors="coerce")
+    fechas_filtro = pd.to_datetime(filtered_df["Última inspección"], errors="coerce")
 
-    if preset_sel == "Ãšltima semana":
+    if preset_sel == "Última semana":
         limite = hoy - pd.Timedelta(days=7)
         mask_fecha = fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)
         filtered_df = filtered_df[mask_fecha]
-    elif preset_sel == "Ãšltimo mes":
+    elif preset_sel == "Último mes":
         limite = hoy - pd.Timedelta(days=30)
         mask_fecha = fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)
         filtered_df = filtered_df[mask_fecha]
-    elif preset_sel == "No en la Ãºltima semana":
+    elif preset_sel == "No en la última semana":
         limite = hoy - pd.Timedelta(days=7)
         mask_fecha = fechas_filtro.isna() | (fechas_filtro.dt.date < limite)
         filtered_df = filtered_df[mask_fecha]
-    elif preset_sel == "No en el Ãºltimo mes":
+    elif preset_sel == "No en el último mes":
         limite = hoy - pd.Timedelta(days=30)
         mask_fecha = fechas_filtro.isna() | (fechas_filtro.dt.date < limite)
         filtered_df = filtered_df[mask_fecha]
@@ -827,7 +978,7 @@ if "result_df" in st.session_state:
         )
 
     st.markdown("---")
-    st.caption("Â¿Necesitas todo sin filtrar? DescÃ¡rgalo aquÃ­:")
+    st.caption("¿Necesitas todo sin filtrar? Descárgalo aquí:")
     dcol3, dcol4 = st.columns(2)
     with dcol3:
         st.download_button(
