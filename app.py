@@ -50,17 +50,17 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 
 st.set_page_config(page_title="GCTS - Cruce Objetivos SAFA/SACA/SANA", layout="wide")
 
-st.title("Cruce automático: Lista de tráfico (NOP) + Objetivos SAFA/SACA/SANA")
+st.title("Cruce automÃ¡tico: Lista de trÃ¡fico (NOP) + Objetivos SAFA/SACA/SANA")
 st.caption(
-    "Sube el PDF de la lista de tráfico (NOP Eurocontrol, formato ARCID) y el Excel maestro "
-    "de Objetivos SAFA/SACA/SANA/Matrículas. La app cruza cada vuelo por el prefijo ARCID (3 letras) "
+    "Sube el PDF de la lista de trÃ¡fico (NOP Eurocontrol, formato ARCID) y el Excel maestro "
+    "de Objetivos SAFA/SACA/SANA/MatrÃ­culas. La app cruza cada vuelo por el prefijo ARCID (3 letras) "
     "y genera un Excel y un PDF enriquecidos con Tipo de objetivo, inspecciones realizadas, "
-    "objetivo 2026, restantes y última inspección."
+    "objetivo 2026, restantes y Ãºltima inspecciÃ³n."
 )
 
 col1, col2 = st.columns(2)
 with col1:
-    pdf_file = st.file_uploader("1. PDF de tráfico (NOP / ARCID)", type=["pdf"])
+    pdf_file = st.file_uploader("1. PDF de trÃ¡fico (NOP / ARCID)", type=["pdf"])
 with col2:
     xlsx_file = st.file_uploader("2. Excel maestro (Objetivos SAFA/SACA/SANA)", type=["xlsx"])
 
@@ -481,7 +481,7 @@ def cross_reference(flights_df, icao_map, l1_map, l2_map, sana_map):
             "Matricula": r.get("Matricula", ""),
             "ADEP": r["ADEP"], "ADES": r["ADES"], "Operador (maestro)": op,
             "Tipo objetivo": tipo, "Inspecciones realizadas": done, "Objetivo 2026": obj,
-            "Restantes": rem, "Última inspección": last, "Fuente cruce": src,
+            "Restantes": rem, "Ãšltima inspecciÃ³n": last, "Fuente cruce": src,
         })
     return pd.DataFrame(out)
 
@@ -493,7 +493,7 @@ def build_excel(df, fecha_str):
     ws.column_dimensions["A"].width = 3
 
     ws.merge_cells("B2:M2")
-    ws["B2"] = f"GCTS - {fecha_str} - Lista de tráfico enriquecida con Objetivos SAFA/SACA/SANA"
+    ws["B2"] = f"GCTS - {fecha_str} - Lista de trÃ¡fico enriquecida con Objetivos SAFA/SACA/SANA"
     ws["B2"].font = Font(name="Calibri", size=14, bold=True, color="1F3864")
 
     ws.merge_cells("B3:M3")
@@ -514,7 +514,7 @@ def build_excel(df, fecha_str):
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     centered = {"Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "Tipo objetivo",
-                "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección"}
+                "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Ãšltima inspecciÃ³n"}
 
     for i, row in df.iterrows():
         r = header_row + 1 + i
@@ -533,7 +533,7 @@ def build_excel(df, fecha_str):
 
     widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "Matricula": 12, "ADEP": 8, "ADES": 8,
               "Operador (maestro)": 42, "Tipo objetivo": 14, "Inspecciones realizadas": 12,
-              "Objetivo 2026": 12, "Restantes": 10, "Última inspección": 16, "Fuente cruce": 20}
+              "Objetivo 2026": 12, "Restantes": 10, "Ãšltima inspecciÃ³n": 16, "Fuente cruce": 20}
     for j, h in enumerate(headers, start=2):
         ws.column_dimensions[get_column_letter(j)].width = widths.get(h, 14)
 
@@ -563,10 +563,10 @@ def build_pdf(df, fecha_str):
     styles.add(ParagraphStyle(name="T", fontName="Helvetica", fontSize=5.6, leading=6.0))
 
     headers = ["Hora", "ARCID", "Aeronave", "ADEP", "ADES", "Operador maestro",
-               "Tipo objetivo", "Realiz.", "Objetivo", "Rest.", "Última inspección", "Fuente"]
+               "Tipo objetivo", "Realiz.", "Objetivo", "Rest.", "Ãšltima inspecciÃ³n", "Fuente"]
 
     parts = [
-        Paragraph(f"GCTS {fecha_str} - PDF reconstruido con columnas añadidas", styles["Title"]),
+        Paragraph(f"GCTS {fecha_str} - PDF reconstruido con columnas aÃ±adidas", styles["Title"]),
         Spacer(1, 4),
         Paragraph("Cruce principal por prefijo ARCID (3 letras) con Excel maestro.", styles["S"]),
         Spacer(1, 6),
@@ -585,7 +585,7 @@ def build_pdf(df, fecha_str):
                 "" if pd.isna(x["Inspecciones realizadas"]) else str(x["Inspecciones realizadas"]),
                 "" if pd.isna(x["Objetivo 2026"]) else str(x["Objetivo 2026"]),
                 "" if pd.isna(x["Restantes"]) else str(x["Restantes"]),
-                str(x["Última inspección"])[:16], x["Fuente cruce"],
+                str(x["Ãšltima inspecciÃ³n"])[:16], x["Fuente cruce"],
             ])
         t = Table(data, colWidths=col_widths, repeatRows=1)
         t.setStyle(TableStyle([
@@ -665,10 +665,10 @@ if "result_df" in st.session_state:
         pct = detected / expected_total * 100 if expected_total else 0
         missing = max(expected_total - detected, 0)
         if missing == 0:
-            st.info(f"✅ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). Coincide con el total declarado en el PDF.")
+            st.info(f"âœ… Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). Coincide con el total declarado en el PDF.")
         else:
             st.warning(
-                f"⚠️ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). "
+                f"âš ï¸ Cobertura: {detected} de {expected_total} vuelos detectados ({pct:.0f}%). "
                 f"Faltan {missing} vuelo(s) por identificar; revisa manualmente el PDF original para esos casos."
             )
 
@@ -691,9 +691,9 @@ if "result_df" in st.session_state:
                         use_container_width=True,
                     )
                     st.caption(
-                        "Estos vuelos aparecen en el texto extraído del PDF (marcador de hora + indicador A/E/C) "
+                        "Estos vuelos aparecen en el texto extraÃ­do del PDF (marcador de hora + indicador A/E/C) "
                         "pero no llegaron a la tabla final, normalmente porque el tipo de aeronave no coincide con "
-                        "los códigos reconocidos (ATYP_PAT) o porque el bloque de texto quedó incompleto."
+                        "los cÃ³digos reconocidos (ATYP_PAT) o porque el bloque de texto quedÃ³ incompleto."
                     )
     else:
         st.caption(f"No se ha podido leer el total declarado de vuelos en el PDF; se muestran los {len(result_df)} vuelos detectados.")
@@ -713,7 +713,7 @@ if "result_df" in st.session_state:
             [a for a in result_df["ADES"].dropna().unique().tolist() if a]
         )
         incluir_ades_vacios = result_df["ADES"].isna().any() or (result_df["ADES"] == "").any()
-        opciones_ades = (["(vacío)"] if incluir_ades_vacios else []) + ades_disponibles
+        opciones_ades = (["(vacÃ­o)"] if incluir_ades_vacios else []) + ades_disponibles
         ades_sel = st.multiselect("ADES (destino)", opciones_ades, default=[])
     with fcol3:
         operadores_disponibles = sorted(
@@ -734,7 +734,7 @@ if "result_df" in st.session_state:
             "Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1))
         )
     with fcol6:
-        fechas_validas = pd.to_datetime(result_df["Última inspección"], errors="coerce")
+        fechas_validas = pd.to_datetime(result_df["Ãšltima inspecciÃ³n"], errors="coerce")
         if fechas_validas.notna().any():
             min_fecha, max_fecha = fechas_validas.min().date(), fechas_validas.max().date()
         else:
@@ -742,13 +742,13 @@ if "result_df" in st.session_state:
 
         preset_opciones = [
             "Todas las fechas",
-            "Última semana",
-            "Último mes",
-            "No en la última semana",
-            "No en el último mes",
+            "Ãšltima semana",
+            "Ãšltimo mes",
+            "No en la Ãºltima semana",
+            "No en el Ãºltimo mes",
             "Rango personalizado",
         ]
-        preset_sel = st.selectbox("Última inspección", preset_opciones, index=0)
+        preset_sel = st.selectbox("Ãšltima inspecciÃ³n", preset_opciones, index=0)
 
         fecha_range = None
         if preset_sel == "Rango personalizado":
@@ -762,8 +762,8 @@ if "result_df" in st.session_state:
             filtered_df["ARCID"].str.contains(texto_busqueda.strip(), case=False, na=False)
         ]
     if ades_sel:
-        quiere_vacios = "(vacío)" in ades_sel
-        valores_reales = [a for a in ades_sel if a != "(vacío)"]
+        quiere_vacios = "(vacÃ­o)" in ades_sel
+        valores_reales = [a for a in ades_sel if a != "(vacÃ­o)"]
         mask_ades = filtered_df["ADES"].isin(valores_reales)
         if quiere_vacios:
             mask_ades = mask_ades | filtered_df["ADES"].isna() | (filtered_df["ADES"] == "")
@@ -779,21 +779,21 @@ if "result_df" in st.session_state:
     ]
 
     hoy = datetime.now().date()
-    fechas_filtro = pd.to_datetime(filtered_df["Última inspección"], errors="coerce")
+    fechas_filtro = pd.to_datetime(filtered_df["Ãšltima inspecciÃ³n"], errors="coerce")
 
-    if preset_sel == "Última semana":
+    if preset_sel == "Ãšltima semana":
         limite = hoy - pd.Timedelta(days=7)
         mask_fecha = fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)
         filtered_df = filtered_df[mask_fecha]
-    elif preset_sel == "Último mes":
+    elif preset_sel == "Ãšltimo mes":
         limite = hoy - pd.Timedelta(days=30)
         mask_fecha = fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)
         filtered_df = filtered_df[mask_fecha]
-    elif preset_sel == "No en la última semana":
+    elif preset_sel == "No en la Ãºltima semana":
         limite = hoy - pd.Timedelta(days=7)
         mask_fecha = fechas_filtro.isna() | (fechas_filtro.dt.date < limite)
         filtered_df = filtered_df[mask_fecha]
-    elif preset_sel == "No en el último mes":
+    elif preset_sel == "No en el Ãºltimo mes":
         limite = hoy - pd.Timedelta(days=30)
         mask_fecha = fechas_filtro.isna() | (fechas_filtro.dt.date < limite)
         filtered_df = filtered_df[mask_fecha]
@@ -827,7 +827,7 @@ if "result_df" in st.session_state:
         )
 
     st.markdown("---")
-    st.caption("¿Necesitas todo sin filtrar? Descárgalo aquí:")
+    st.caption("Â¿Necesitas todo sin filtrar? DescÃ¡rgalo aquÃ­:")
     dcol3, dcol4 = st.columns(2)
     with dcol3:
         st.download_button(
