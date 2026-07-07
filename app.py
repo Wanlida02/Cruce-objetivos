@@ -1,4 +1,35 @@
 import re
+
+REG_EXPECTED_LEN = {
+    'A7': 5,
+    'A6': 5,
+    'EC': 5,
+}
+
+CURRENT_PDF_ICAOS = set()
+
+def _choose_best_reg(reg_raw):
+    if not reg_raw:
+        return ''
+    candidates = []
+    for p in REG_PREFIXES_SORTED:
+        if reg_raw.startswith(p) and len(reg_raw) > len(p):
+            suffix = reg_raw[len(p):]
+            if 2 <= len(suffix) <= 4 and suffix.isalnum():
+                reg = f"{p}-{suffix}"
+                score = 0
+                if len(suffix) > 3:
+                    score += 1
+                exp = REG_EXPECTED_LEN.get(p)
+                if exp and len(suffix) == exp - len(p):
+                    score -= 1
+                candidates.append((score, reg))
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+    return reg_raw
+
+import re
 from io import BytesIO
 from datetime import datetime
 
@@ -135,6 +166,28 @@ def _parse_format1(raw_lines):
     return pd.DataFrame(rows)
 
 
+CURRENT_PDF_ICAOS = set()
+
+def _extract_reg_airports(block):
+    compact = block.replace(" ", "").replace(">", "")
+    if not compact:
+        return "", "", ""
+    airport_hits = [(m.start(), m.group(0)) for m in re.finditer(r'[A-Z]{4}', compact) if m.group(0) in CURRENT_PDF_ICAOS]
+    if len(airport_hits) >= 2:
+        adep = airport_hits[-2][1]
+        ades = airport_hits[-1][1]
+        reg_raw = compact[:airport_hits[-2][0]]
+        return reg_raw, adep, ades
+    generic_hits = list(re.finditer(r'[A-Z]{4}', compact))
+    if len(generic_hits) >= 2:
+        adep = generic_hits[-2].group(0)
+        ades = generic_hits[-1].group(0)
+        reg_raw = compact[:generic_hits[-2].start()]
+        return reg_raw, adep, ades
+    if len(compact) >= 8:
+        return compact[:-8], compact[-8:-4], compact[-4:]
+    return "", compact[:4], compact[4:8]
+
 def _parse_one_flight_chunk(hora, rest):
     """Parses a single flight's text chunk (already isolated from any neighbouring
     flights that pdfplumber may have fused onto the same physical line) starting
@@ -178,36 +231,13 @@ def _parse_one_flight_chunk(hora, rest):
     else:
         reg_airport_block = remainder
 
-    reg_airport_block = reg_airport_block.replace(" ", "").replace(">", "")
-
-    m_airports = list(re.finditer(r'[A-Z]{4}', reg_airport_block))
-    if len(m_airports) >= 2:
-        adep = m_airports[-2].group(0)
-        ades = m_airports[-1].group(0)
-        reg_raw = reg_airport_block[:m_airports[-2].start()]
-    elif len(reg_airports := m_airports) == 1:
-        adep = reg_airport_block[:4]
-        ades = reg_airport_block[4:8]
-        reg_raw = reg_airport_block[8:m_airports[0].start()] if m_airports[0].start() >= 8 else ""
-    elif len(reg_airport_block) >= 8:
-        adep = reg_airport_block[-8:-4]
-        ades = reg_airport_block[-4:]
-        reg_raw = reg_airport_block[:-8]
-    else:
-        adep = reg_airport_block[:4]
-        ades = reg_airport_block[4:8]
-        reg_raw = ""
+    reg_raw, adep, ades = _extract_reg_airports(reg_airport_block)
 
     # Registrations follow the ICAO nationality-prefix format (1-2 letters,
     # hyphen, up to 5 alphanumeric chars), e.g. "EC-MIF", "OE-IZF", "9H-QAD",
     # "HB-JXP". Insert the hyphen after the recognised prefix length so it
     # reads naturally; fall back to the raw text if it doesn't fit the pattern.
-    reg = reg_raw
-    if reg_raw:
-        for p in REG_PREFIXES_SORTED:
-            if reg_raw.startswith(p) and len(reg_raw) - len(p) >= 2:
-                reg = f"{p}-{reg_raw[len(p):]}"
-                break
+    reg = _choose_best_reg(reg_raw) if reg_raw else ''
 
     return {
         "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "Matricula": reg,
