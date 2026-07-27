@@ -762,6 +762,187 @@ def build_pdf(df, fecha_str):
     return buf
 
 
+def infer_inspection_airport(df):
+    airports = pd.concat([
+        df.get("ADEP", pd.Series(dtype=str)),
+        df.get("ADES", pd.Series(dtype=str))
+    ], ignore_index=True)
+    airports = airports.astype(str).str.upper().str.strip()
+    airports = airports[airports.str.fullmatch(r"[A-Z]{4}", na=False)]
+    if airports.empty:
+        return ""
+    return airports.value_counts().idxmax()
+
+
+def classify_movement(row, inspection_airport):
+    adep = str(row.get("ADEP", "")).strip().upper()
+    ades = str(row.get("ADES", "")).strip().upper()
+    if not inspection_airport:
+        return "—"
+    if adep == inspection_airport and ades != inspection_airport:
+        return "↑"
+    if ades == inspection_airport and adep != inspection_airport:
+        return "↓"
+    return "—"
+
+
+def row_is_suspicious(row):
+    adep = str(row.get("ADEP", "")).strip().upper()
+    ades = str(row.get("ADES", "")).strip().upper()
+    reg = str(row.get("Matricula", "")).strip().upper()
+    arcid = str(row.get("ARCID", "")).strip().upper()
+    reasons = []
+    if not re.fullmatch(r"[A-Z]{4}", adep):
+        reasons.append("ADEP dudoso")
+    if not re.fullmatch(r"[A-Z]{4}", ades):
+        reasons.append("ADES dudoso")
+    if not reg or len(reg) < 3:
+        reasons.append("Matrícula vacía o corta")
+    if not re.fullmatch(r"[A-Z]{2,4}\d+[A-Z]?", arcid):
+        reasons.append("ARCID dudoso")
+    return "; ".join(reasons)
+
+
+def build_unidentified_report(raw_candidates_df, result_df):
+    if raw_candidates_df is None or raw_candidates_df.empty:
+        return pd.DataFrame(columns=["Hora", "ARCID_guess", "parsed_ok", "estado", "detalle"])
+
+    raw = raw_candidates_df.copy()
+    raw["Hora_norm"] = raw["Hora"].astype(str).str.strip()
+    raw["ARCID_norm"] = raw["ARCID_guess"].astype(str).str.upper().str.strip()
+
+    final_df = result_df.copy()
+    final_df["Hora_norm"] = final_df["Hora"].astype(str).str.strip()
+    final_df["ARCID_norm"] = final_df["ARCID"].astype(str).str.upper().str.strip()
+
+    matched_pairs = set(zip(final_df["Hora_norm"], final_df["ARCID_norm"]))
+    matched_arcids = set(final_df["ARCID_norm"])
+
+    def classify_raw(r):
+        if (r["Hora_norm"], r["ARCID_norm"]) in matched_pairs:
+            return "detectado"
+        if r["ARCID_norm"] in matched_arcids:
+            return "posible diferencia de hora/duplicado"
+        return "ausente en tabla final"
+
+    raw["estado"] = raw.apply(classify_raw, axis=1)
+    missing = raw[raw["estado"] != "detectado"].copy()
+    if not missing.empty:
+        missing["detalle"] = missing["estado"].map({
+            "ausente en tabla final": "No entró en la tabla final",
+            "posible diferencia de hora/duplicado": "El ARCID existe en la tabla final, pero no con la misma combinación hora+ARCID",
+        }).fillna("")
+
+    suspicious = final_df.copy()
+    suspicious["detalle"] = suspicious.apply(row_is_suspicious, axis=1)
+    suspicious = suspicious[suspicious["detalle"] != ""].copy()
+    if not suspicious.empty:
+        suspicious = suspicious.rename(columns={"ARCID": "ARCID_guess"})
+        suspicious["parsed_ok"] = True
+        suspicious["estado"] = "parseo sospechoso en tabla final"
+        suspicious = suspicious[["Hora", "ARCID_guess", "parsed_ok", "estado", "detalle"]]
+
+    cols = ["Hora", "ARCID_guess", "parsed_ok", "estado", "detalle"]
+    parts = []
+    if not missing.empty:
+        parts.append(missing[cols])
+    if not suspicious.empty:
+        parts.append(suspicious[cols])
+    if not parts:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(parts, ignore_index=True).drop_duplicates()
+    return out.sort_values(["estado", "Hora", "ARCID_guess"], na_position="last").reset_index(drop=True)
+
+
+def build_printable_html(df, fecha_str, inspection_airport):
+    def esc(val):
+        if pd.isna(val):
+            return ""
+        return str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    headers = [
+        ("Hora", "Hora"),
+        ("Mov.", "Mov."),
+        ("ARCID", "ARCID"),
+        ("Aeronave", "Aeronave"),
+        ("Matrícula", "Matricula"),
+        ("ADEP", "ADEP"),
+        ("ADES", "ADES"),
+        ("Operador (maestro)", "Operador (maestro)"),
+        ("Tipo objetivo", "Tipo objetivo"),
+        ("Inspecciones realizadas", "Inspecciones realizadas"),
+        ("Objetivo 2026", "Objetivo 2026"),
+        ("Restantes", "Restantes"),
+        ("Última inspección", "Última inspección"),
+        ("Fuente cruce", "Fuente cruce"),
+    ]
+    th = ''.join(f'<th>{esc(label)}</th>' for label, _ in headers)
+    rows = []
+    for _, r in df.iterrows():
+        mov = str(r.get("Mov.", "")).strip()
+        row_class = "row-departure" if mov == "↑" else ("row-arrival" if mov == "↓" else "")
+        tds = ''.join(f'<td>{esc(r.get(col, ""))}</td>' for _, col in headers)
+        rows.append(f'<tr class="{row_class}">{tds}</tr>')
+    body = ''.join(rows) or f'<tr><td colspan="{len(headers)}">No hay vuelos seleccionados.</td></tr>'
+
+    style = """
+:root { color-scheme: light; }
+body { font-family: Arial, sans-serif; margin: 24px; color: #1f2937; }
+h1 { font-size: 22px; margin: 0 0 6px; }
+p { margin: 0 0 10px; font-size: 13px; }
+.toolbar { display:flex; gap:12px; margin: 16px 0 18px; }
+button { padding:10px 14px; border:0; border-radius:8px; background:#0f766e; color:white; cursor:pointer; }
+button.secondary { background:#475569; }
+table { width:100%; border-collapse:collapse; font-size:11px; }
+th, td { border:1px solid #cbd5e1; padding:6px 7px; vertical-align:top; text-align:left; }
+th { background:#e2e8f0; }
+tr:nth-child(even) td { background:#f8fafc; }
+tr.row-departure td { background:#dff3e4 !important; }
+tr.row-arrival td { background:#fde7d6 !important; }
+.legend { display:flex; gap:16px; margin: 8px 0 14px; font-size:12px; }
+.legend span { display:inline-flex; align-items:center; gap:6px; }
+.swatch { width:14px; height:14px; border:1px solid #94a3b8; border-radius:3px; display:inline-block; }
+.swatch.departure { background:#dff3e4; }
+.swatch.arrival { background:#fde7d6; }
+@media print { .toolbar { display:none; } body { margin: 8mm; } }
+"""
+
+    return """<!doctype html>
+<html lang=\"es\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>Vista imprimible {title}</title>
+<style>{style}</style>
+</head>
+<body>
+<h1>Cruce filtrado listo para impresión</h1>
+<p>Fecha de generación: {fecha}. Aeropuerto inferido para inspección: <strong>{airport}</strong>.</p>
+<p>Selecciona “Imprimir / Guardar como PDF” en el navegador.</p>
+<div class=\"legend\">
+<span><i class=\"swatch departure\"></i> Salida ↑</span>
+<span><i class=\"swatch arrival\"></i> Llegada ↓</span>
+</div>
+<div class=\"toolbar\">
+<button onclick=\"window.print()\">Imprimir / Guardar como PDF</button>
+<button class=\"secondary\" onclick=\"window.close()\">Cerrar</button>
+</div>
+<table>
+<thead><tr>{th}</tr></thead>
+<tbody>{body}</tbody>
+</table>
+</body>
+</html>""".format(
+        title=esc(fecha_str),
+        style=style,
+        fecha=esc(fecha_str),
+        airport=esc(inspection_airport or 'No inferido'),
+        th=th,
+        body=body,
+    )
+
+
 if run:
     with st.spinner("Leyendo PDF y Excel, y cruzando datos..."):
         pdf_bytes = pdf_file.read()
@@ -789,11 +970,15 @@ if run:
         # does NOT discard the cross-reference results and force the user
         # to click "Generar cruce" again. session_state survives reruns
         # within the same browser session/tab.
+        inspection_airport = infer_inspection_airport(result_df)
+        result_df["Mov."] = result_df.apply(lambda r: classify_movement(r, inspection_airport), axis=1)
+
         st.session_state["result_df"] = result_df
         st.session_state["excel_buf"] = excel_buf.getvalue()
         st.session_state["fecha_str"] = fecha_str
         st.session_state["expected_total"] = expected_total
         st.session_state["raw_candidates_df"] = raw_candidates_df
+        st.session_state["inspection_airport"] = inspection_airport
 
 if "result_df" in st.session_state:
     result_df = st.session_state["result_df"]
@@ -801,7 +986,7 @@ if "result_df" in st.session_state:
     expected_total = st.session_state.get("expected_total")
     raw_candidates_df = st.session_state.get("raw_candidates_df")
     excel_buf = BytesIO(st.session_state["excel_buf"])
-    pdf_buf = build_pdf(result_df, fecha_str)
+    inspection_airport = st.session_state.get("inspection_airport", "")
 
     # Anchor so that after opening a downloaded/printed PDF in a new tab
     # (which some browsers do for inline PDF viewers), the user can click
@@ -826,25 +1011,25 @@ if "result_df" in st.session_state:
         # Comparison button: show which flights were found in the raw PDF text
         # (via the HH:MM[A|E|C] marker scan) but did not end up in the final
         # parsed/cross-referenced table.
-        if missing > 0 and raw_candidates_df is not None and not raw_candidates_df.empty:
-            if st.button("Ver vuelos no detectados"):
-                detected_arcids = set(result_df["ARCID"].astype(str).str.upper())
-                raw_candidates_df["ARCID_norm"] = raw_candidates_df["ARCID_guess"].astype(str).str.upper()
-                no_detectados = raw_candidates_df[~raw_candidates_df["ARCID_norm"].isin(detected_arcids)]
+        if raw_candidates_df is not None and not raw_candidates_df.empty:
+            if st.button("Ver vuelos no identificados / sospechosos"):
+                no_detectados = build_unidentified_report(raw_candidates_df, result_df)
                 if no_detectados.empty:
-                    st.success("No se han encontrado vuelos adicionales sin detectar (la diferencia puede deberse a duplicados o formato de hora).")
+                    st.success("No se han encontrado vuelos ausentes ni registros sospechosos en la tabla final.")
                 else:
-                    st.markdown(f"**{len(no_detectados)} vuelo(s) presentes en el texto del PDF pero ausentes en la tabla final:**")
+                    st.markdown(f"**{len(no_detectados)} caso(s) a revisar entre ausentes y parseos sospechosos:**")
                     st.dataframe(
-                        no_detectados[["Hora", "ARCID_guess", "parsed_ok"]].rename(
-                            columns={"ARCID_guess": "ARCID (detectado en texto crudo)", "parsed_ok": "Se pudo parsear tipo/aeropuertos"}
-                        ),
+                        no_detectados.rename(columns={
+                            "ARCID_guess": "ARCID",
+                            "parsed_ok": "Parseo base OK",
+                            "estado": "Estado",
+                            "detalle": "Detalle",
+                        }),
                         use_container_width=True,
                     )
                     st.caption(
-                        "Estos vuelos aparecen en el texto extraído del PDF (marcador de hora + indicador A/E/C) "
-                        "pero no llegaron a la tabla final, normalmente porque el tipo de aeronave no coincide con "
-                        "los códigos reconocidos (ATYP_PAT) o porque el bloque de texto quedó incompleto."
+                        "Aquí se combinan dos diagnósticos: vuelos presentes en el texto bruto que no llegaron a la tabla final, "
+                        "y filas presentes en la tabla final cuyo parseo sigue pareciendo dudoso."
                     )
     else:
         st.caption(f"No se ha podido leer el total declarado de vuelos en el PDF; se muestran los {len(result_df)} vuelos detectados.")
@@ -955,11 +1140,20 @@ if "result_df" in st.session_state:
         filtered_df = filtered_df[mask_fecha]
     # "Todas las fechas" -> no additional filtering
 
-    st.caption(f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros.")
+    ordered_cols = [
+        "Hora", "Mov.", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES",
+        "Operador (maestro)", "Tipo objetivo", "Inspecciones realizadas", "Objetivo 2026",
+        "Restantes", "Última inspección", "Fuente cruce"
+    ]
+    filtered_df = filtered_df[[c for c in ordered_cols if c in filtered_df.columns]]
+
+    st.caption(
+        f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros. "
+        f"Aeropuerto de inspección inferido: {inspection_airport or 'No inferido'}."
+    )
     st.dataframe(filtered_df, use_container_width=True, height=500)
 
     excel_buf_filtered = build_excel(filtered_df.reset_index(drop=True), fecha_str)
-    pdf_buf_filtered = build_pdf(filtered_df.reset_index(drop=True), fecha_str)
 
     dcol1, dcol2 = st.columns(2)
     with dcol1:
@@ -970,29 +1164,82 @@ if "result_df" in st.session_state:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with dcol2:
-        st.download_button(
-            "Descargar PDF (con filtros aplicados)",
-            data=pdf_buf_filtered,
-            file_name=f"GCTS_{fecha_str}_Reconstruido_filtrado.pdf",
-            mime="application/pdf",
-        )
+        if st.button("Preparar impresión PDF", use_container_width=True):
+            st.session_state["print_source_df"] = filtered_df.reset_index(drop=True).copy()
+            st.session_state["open_print_dialog"] = True
 
     st.markdown("---")
     st.caption("¿Necesitas todo sin filtrar? Descárgalo aquí:")
-    dcol3, dcol4 = st.columns(2)
-    with dcol3:
-        st.download_button(
-            "Descargar Excel completo (sin filtros)",
-            data=excel_buf,
-            file_name=f"GCTS_{fecha_str}_Enriquecido_completo.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    with dcol4:
-        st.download_button(
-            "Descargar PDF completo (sin filtros)",
-            data=pdf_buf,
-            file_name=f"GCTS_{fecha_str}_Reconstruido_completo.pdf",
-            mime="application/pdf",
-        )
+    st.download_button(
+        "Descargar Excel completo (sin filtros)",
+        data=excel_buf,
+        file_name=f"GCTS_{fecha_str}_Enriquecido_completo.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    if st.session_state.get("open_print_dialog") and "print_source_df" in st.session_state:
+        @st.dialog("Seleccionar vuelos para imprimir", width="large")
+        def print_dialog():
+            source_df = st.session_state["print_source_df"].copy().reset_index(drop=True)
+            st.caption("Los vuelos salen sin seleccionar por defecto. Puedes filtrar por columnas y marcar solo los que quieras.")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                q_arcid = st.text_input("Filtrar ARCID", key="print_q_arcid")
+            with c2:
+                q_operador = st.text_input("Filtrar operador", key="print_q_operador")
+            with c3:
+                q_airport = st.text_input("Filtrar ADEP/ADES", key="print_q_airport")
+
+            c4, c5 = st.columns(2)
+            with c4:
+                mov_opts = ["↑", "↓", "—"]
+                mov_sel = st.multiselect("Movimiento", mov_opts, default=mov_opts, key="print_mov_sel")
+            with c5:
+                tipo_opts = sorted([x for x in source_df["Tipo objetivo"].dropna().astype(str).unique().tolist() if x])
+                tipo_sel = st.multiselect("Tipo objetivo", tipo_opts, default=tipo_opts, key="print_tipo_sel")
+
+            view_df = source_df.copy()
+            if q_arcid.strip():
+                view_df = view_df[view_df["ARCID"].astype(str).str.contains(q_arcid.strip(), case=False, na=False)]
+            if q_operador.strip():
+                view_df = view_df[view_df["Operador (maestro)"].astype(str).str.contains(q_operador.strip(), case=False, na=False)]
+            if q_airport.strip():
+                mask_air = view_df["ADEP"].astype(str).str.contains(q_airport.strip(), case=False, na=False) | view_df["ADES"].astype(str).str.contains(q_airport.strip(), case=False, na=False)
+                view_df = view_df[mask_air]
+            if mov_sel:
+                view_df = view_df[view_df["Mov."].isin(mov_sel)]
+            if tipo_sel:
+                view_df = view_df[view_df["Tipo objetivo"].astype(str).isin(tipo_sel)]
+
+            editor_df = view_df.copy()
+            editor_df.insert(0, "Seleccionar", False)
+            edited = st.data_editor(
+                editor_df,
+                hide_index=True,
+                use_container_width=True,
+                height=420,
+                column_config={"Seleccionar": st.column_config.CheckboxColumn(help="Marca los vuelos a imprimir")},
+                disabled=[c for c in editor_df.columns if c != "Seleccionar"],
+                key="print_editor",
+            )
+
+            selected = edited[edited["Seleccionar"]].drop(columns=["Seleccionar"], errors="ignore").reset_index(drop=True)
+            st.caption(f"Seleccionados: {len(selected)} vuelo(s).")
+
+            b1, b2 = st.columns(2)
+            with b1:
+                open_print = st.button("Abrir vista imprimible", type="primary", use_container_width=True, disabled=selected.empty)
+            with b2:
+                close_print = st.button("Cerrar", use_container_width=True)
+
+            if open_print and not selected.empty:
+                html = build_printable_html(selected, fecha_str, inspection_airport)
+                st.components.v1.html(html, height=650, scrolling=True)
+            if close_print:
+                st.session_state["open_print_dialog"] = False
+                st.rerun()
+
+        print_dialog()
 elif not run:
     st.info("Sube ambos archivos y pulsa 'Generar cruce' para empezar.")
