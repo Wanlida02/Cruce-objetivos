@@ -1187,7 +1187,8 @@ if "result_df" in st.session_state:
             with c1:
                 q_arcid = st.text_input("Filtrar ARCID", key="print_q_arcid")
             with c2:
-                q_operador = st.text_input("Filtrar operador", key="print_q_operador")
+                operadores_opts = sorted([x for x in source_df["Operador (maestro)"].dropna().astype(str).unique().tolist() if x])
+                operadores_sel = st.multiselect("Operadores incluidos", options=operadores_opts, default=operadores_opts, key="print_operadores_sel")
             with c3:
                 q_airport = st.text_input("Filtrar ADEP/ADES", key="print_q_airport")
 
@@ -1202,8 +1203,8 @@ if "result_df" in st.session_state:
             view_df = source_df.copy()
             if q_arcid.strip():
                 view_df = view_df[view_df["ARCID"].astype(str).str.contains(q_arcid.strip(), case=False, na=False)]
-            if q_operador.strip():
-                view_df = view_df[view_df["Operador (maestro)"].astype(str).str.contains(q_operador.strip(), case=False, na=False)]
+            if operadores_sel:
+                view_df = view_df[view_df["Operador (maestro)"].astype(str).isin(operadores_sel)]
             if q_airport.strip():
                 mask_air = view_df["ADEP"].astype(str).str.contains(q_airport.strip(), case=False, na=False) | view_df["ADES"].astype(str).str.contains(q_airport.strip(), case=False, na=False)
                 view_df = view_df[mask_air]
