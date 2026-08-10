@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
+import unicodedata
 
 import openpyxl
 import pandas as pd
@@ -67,6 +68,29 @@ class CrossResult:
     restantes: Optional[object]
     ultima: str
     fuente: str
+
+
+def _norm_header(value) -> str:
+    """Normalizes a column header for robust matching: strips accents,
+    uppercases, collapses whitespace. This lets the app tolerate real-world
+    header variations like 'OACI' vs '3LC', 'OPERADOR' vs 'Operator Name',
+    or 'Nº APROBAC.' vs 'N APROBAC' without silently returning empty data."""
+    s = str(value or "")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\s+", " ", s).strip().upper()
+    return s
+
+
+def _find_col(headers_norm: Dict[str, int], candidates: List[str]) -> Optional[int]:
+    """Finds the first header (already normalized) containing ANY of the
+    candidate substrings (also normalized). Returns the column index or None."""
+    for cand in candidates:
+        cand_norm = _norm_header(cand)
+        for h_norm, idx in headers_norm.items():
+            if cand_norm in h_norm:
+                return idx
+    return None
 
 
 def choose_best_registration(reg_raw: str) -> str:
@@ -304,11 +328,10 @@ def load_sheet(xlsx_bytes: bytes, sheetname: str, max_col: int = 60):
 def find_sheet_name(available_sheets: List[str], keywords: List[str]) -> Optional[str]:
     """Finds the real worksheet name matching ALL keywords (case-insensitive,
     substring match), so small naming variations in the master Excel (e.g.
-    'SANA' vs 'SANA Objectives', 'ICAO CODE' vs 'ICAO_CODE') don't crash the
-    app with a hard KeyError like `wb["SANA"]` would."""
-    normalized = {s: s.upper() for s in available_sheets}
+    'SANA' vs 'SANA Objectives') don't crash the app with a hard KeyError."""
+    normalized = {s: _norm_header(s) for s in available_sheets}
     for sheet, upper in normalized.items():
-        if all(kw.upper() in upper for kw in keywords):
+        if all(_norm_header(kw) in upper for kw in keywords):
             return sheet
     return None
 
@@ -348,77 +371,104 @@ def build_master_maps(xlsx_bytes: bytes):
     l1_map: Dict[str, dict] = {}
     if l1_sheet:
         h1, r1 = load_sheet(xlsx_bytes, l1_sheet)
-        idx1 = {h: i for i, h in enumerate(h1) if h}
+        h1_norm = {_norm_header(h): i for i, h in enumerate(h1) if h}
+        code_idx = _find_col(h1_norm, ["3LC", "OACI"])
+        op_idx = _find_col(h1_norm, ["OPERATOR NAME", "OPERADOR"])
+        done_idx = _find_col(h1_norm, ["PROGRESS"])
+        obj_idx = _find_col(h1_norm, ["MEAN TARGET"])
+        rem_idx = _find_col(h1_norm, ["REMAINING"])
+        last_idx = _find_col(h1_norm, ["LAST INSPECTION"])
         for row in r1:
-            code = row[idx1.get("3LC")] if "3LC" in idx1 else None
+            code = row[code_idx] if code_idx is not None else None
             if code is None:
                 continue
             code = str(code).strip().upper()
             l1_map[code] = {
-                "operator": row[idx1.get("Operator Name")] if "Operator Name" in idx1 else "",
-                "done": row[idx1.get("Progress")] if "Progress" in idx1 else None,
-                "objective": row[idx1.get("Mean Target")] if "Mean Target" in idx1 else None,
-                "remaining": row[idx1.get("Remaining")] if "Remaining" in idx1 else None,
-                "last": row[idx1.get("Last inspection")] if "Last inspection" in idx1 else None,
+                "operator": row[op_idx] if op_idx is not None else "",
+                "done": row[done_idx] if done_idx is not None else None,
+                "objective": row[obj_idx] if obj_idx is not None else None,
+                "remaining": row[rem_idx] if rem_idx is not None else None,
+                "last": row[last_idx] if last_idx is not None else None,
             }
 
     l2_map: Dict[str, dict] = {}
     if l2_sheet:
         h2, r2 = load_sheet(xlsx_bytes, l2_sheet)
-        idx2 = {h: i for i, h in enumerate(h2) if h}
-        obj_key = next((k for k in idx2 if "OBJECTIVE" in str(k)), None)
-        last_sp_key = next((k for k in idx2 if "LAST INSPECTION SPAIN" in str(k)), None)
-        last_eu_key = next((k for k in idx2 if "LAST INSPECTION EUROPE" in str(k)), None)
+        h2_norm = {_norm_header(h): i for i, h in enumerate(h2) if h}
+        code_idx = _find_col(h2_norm, ["3LC", "OACI"])
+        op_idx = _find_col(h2_norm, ["OPERATOR L2", "OPERADOR"])
+        done_idx = _find_col(h2_norm, ["DONE"])
+        obj_idx = _find_col(h2_norm, ["OBJECTIVE"])
+        rem_idx = _find_col(h2_norm, ["REMAINING"])
+        last_sp_idx = _find_col(h2_norm, ["LAST INSPECTION SPAIN"])
+        last_eu_idx = _find_col(h2_norm, ["LAST INSPECTION EUROPE"])
         for row in r2:
-            code = row[idx2.get("3LC")] if "3LC" in idx2 else None
+            code = row[code_idx] if code_idx is not None else None
             if code is None:
                 continue
             code = str(code).strip().upper()
             l2_map[code] = {
-                "operator": row[idx2.get("OPERATOR L2")] if "OPERATOR L2" in idx2 else "",
-                "done": row[idx2.get("DONE")] if "DONE" in idx2 else None,
-                "objective": row[idx2.get(obj_key)] if obj_key else None,
-                "remaining": row[idx2.get("REMAINING")] if "REMAINING" in idx2 else None,
-                "last": (row[idx2.get(last_sp_key)] if last_sp_key else None) or (row[idx2.get(last_eu_key)] if last_eu_key else None),
+                "operator": row[op_idx] if op_idx is not None else "",
+                "done": row[done_idx] if done_idx is not None else None,
+                "objective": row[obj_idx] if obj_idx is not None else None,
+                "remaining": row[rem_idx] if rem_idx is not None else None,
+                "last": (row[last_sp_idx] if last_sp_idx is not None else None) or (row[last_eu_idx] if last_eu_idx is not None else None),
             }
 
     sana_map: Dict[str, dict] = {}
     if sana_sheet:
         hs, rs = load_sheet(xlsx_bytes, sana_sheet)
-        idxs = {h: i for i, h in enumerate(hs) if h}
+        hs_norm = {_norm_header(h): i for i, h in enumerate(hs) if h}
+        code_idx = _find_col(hs_norm, ["OACI", "3LC"])
+        op_idx = _find_col(hs_norm, ["OPERADOR", "OPERATOR NAME"])
+        obj_idx = _find_col(hs_norm, ["INSPECCIONES OBJETIVO", "OBJECTIVE 2026"])
+        done_idx = _find_col(hs_norm, ["INSPECCIONES REALIZ", "INSPECTIONS 2026"])
+        rem_idx = _find_col(hs_norm, ["FALTANTES", "REMAINING INSPECTIONS"])
+        last_idx = _find_col(hs_norm, ["ULTIMA INSPECCION", "LAST INSPECTION DATE"])
         for row in rs:
-            code = row[idxs.get("3LC")] if "3LC" in idxs else None
-            if code is None:
+            code = row[code_idx] if code_idx is not None else None
+            if code is None or str(code).strip() == "":
                 continue
             code = str(code).strip().upper()
             sana_map[code] = {
-                "operator": row[idxs.get("Operator Name")] if "Operator Name" in idxs else "",
-                "done": row[idxs.get("Inspections 2026")] if "Inspections 2026" in idxs else None,
-                "objective": row[idxs.get("Objective 2026")] if "Objective 2026" in idxs else None,
-                "remaining": row[idxs.get("Remaining inspections")] if "Remaining inspections" in idxs else None,
-                "last": row[idxs.get("Last Inspection Date")] if "Last Inspection Date" in idxs else None,
+                "operator": row[op_idx] if op_idx is not None else "",
+                "done": row[done_idx] if done_idx is not None else None,
+                "objective": row[obj_idx] if obj_idx is not None else None,
+                "remaining": row[rem_idx] if rem_idx is not None else None,
+                "last": row[last_idx] if last_idx is not None else None,
             }
 
     matriculas_map: Dict[str, str] = {}
     if matriculas_sheet:
-        hm, rm = load_sheet(xlsx_bytes, matriculas_sheet, max_col=10)
-        idxm = {h: i for i, h in enumerate(hm) if h}
-        reg_key = next((k for k in idxm if str(k).strip().lower() in ["matricula", "matrícula", "registration"]), None)
-        op_key = next((k for k in idxm if "operator" in str(k).strip().lower()), None)
-        if reg_key and op_key:
+        hm, rm = load_sheet(xlsx_bytes, matriculas_sheet, max_col=20)
+        hm_norm = {_norm_header(h): i for i, h in enumerate(hm) if h}
+        reg_idx = _find_col(hm_norm, ["MATRICULA SIN", "MATRICULA", "REGISTRATION"])
+        # Prefer "OPERADOR" (the real header in the master Excel) but also accept
+        # the English "OPERATOR" so both language variants work.
+        op_idx = _find_col(hm_norm, ["OPERADOR", "OPERATOR"])
+        if reg_idx is not None and op_idx is not None:
             for row in rm:
-                reg = row[idxm.get(reg_key)]
-                op = row[idxm.get(op_key)]
+                reg = row[reg_idx]
+                op = row[op_idx]
                 if reg and op:
-                    matriculas_map[str(reg).strip().upper()] = str(op).strip()
+                    reg_key = str(reg).strip().upper().replace(" ", "")
+                    matriculas_map[reg_key] = str(op).strip()
+                    # Also index the hyphenated form when present, so lookups
+                    # from the PDF (which may or may not include the hyphen)
+                    # both resolve correctly.
+                    if "-" in str(reg):
+                        matriculas_map[str(reg).strip().upper()] = str(op).strip()
 
     return icao_map, l1_map, l2_map, sana_map, matriculas_map
 
 
 def choose_effective_operator(prefix3: str, matricula: str, icao_map: Dict[str, str], matriculas_map: Dict[str, str]) -> Tuple[str, str]:
     matricula_norm = str(matricula).strip().upper() if matricula else ""
+    matricula_nohyphen = matricula_norm.replace("-", "")
     if matricula_norm and matricula_norm in matriculas_map:
         return matriculas_map[matricula_norm], "Operador matrícula"
+    if matricula_nohyphen and matricula_nohyphen in matriculas_map:
+        return matriculas_map[matricula_nohyphen], "Operador matrícula"
     prefix3_norm = str(prefix3).strip().upper() if prefix3 else ""
     if prefix3_norm in icao_map:
         return icao_map[prefix3_norm], "Operador prefijo ICAO"
@@ -562,30 +612,30 @@ def apply_filters(result_df: pd.DataFrame) -> pd.DataFrame:
     st.markdown("### Filtros antes de descargar")
     col1, col2, col3 = st.columns(3)
     with col1:
-        texto_busqueda = st.text_input("ARCID (texto libre)", "")
+        texto_busqueda = st.text_input("ARCID (texto libre)", "", key="filtro_arcid")
     with col2:
         ades_disponibles = sorted([a for a in result_df["ADES"].dropna().unique().tolist() if a])
         incluir_vacios = result_df["ADES"].isna().any() or (result_df["ADES"] == "").any()
         opciones_ades = (["(vacío)"] if incluir_vacios else []) + ades_disponibles
-        ades_sel = st.multiselect("ADES (destino)", opciones_ades, default=[])
+        ades_sel = st.multiselect("ADES (destino)", opciones_ades, default=[], key="filtro_ades")
     with col3:
         operadores_disponibles = sorted([o for o in result_df["Operador (maestro)"].dropna().unique().tolist() if o])
-        operadores_sel = st.multiselect("Operador", operadores_disponibles, default=[])
+        operadores_sel = st.multiselect("Operador", operadores_disponibles, default=[], key="filtro_operador")
 
     col4, col5, col6 = st.columns(3)
     with col4:
         tipos_disponibles = sorted(result_df["Tipo objetivo"].dropna().unique().tolist())
-        tipos_sel = st.multiselect("Tipo objetivo", tipos_disponibles, default=tipos_disponibles)
+        tipos_sel = st.multiselect("Tipo objetivo", tipos_disponibles, default=tipos_disponibles, key="filtro_tipo")
     with col5:
         restantes_num = pd.to_numeric(result_df["Restantes"], errors="coerce")
         max_restantes = int(restantes_num.max()) if restantes_num.notna().any() else 0
-        restantes_range = st.slider("Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1)))
+        restantes_range = st.slider("Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1)), key="filtro_restantes")
     with col6:
         fechas_validas = pd.to_datetime(result_df["Última inspección"], errors="coerce")
         min_fecha = fechas_validas.min().date() if fechas_validas.notna().any() else datetime.now().date()
         max_fecha = fechas_validas.max().date() if fechas_validas.notna().any() else datetime.now().date()
-        preset_sel = st.selectbox("Última inspección", ["Todas las fechas", "Última semana", "Último mes", "No en la última semana", "No en el último mes", "Rango personalizado"], index=0)
-        fecha_range = st.date_input("Rango personalizado de fechas", value=(min_fecha, max_fecha)) if preset_sel == "Rango personalizado" else None
+        preset_sel = st.selectbox("Última inspección", ["Todas las fechas", "Última semana", "Último mes", "No en la última semana", "No en el último mes", "Rango personalizado"], index=0, key="filtro_preset")
+        fecha_range = st.date_input("Rango personalizado de fechas", value=(min_fecha, max_fecha), key="filtro_fecha_range") if preset_sel == "Rango personalizado" else None
 
     filtered_df = result_df.copy()
     if texto_busqueda.strip():
@@ -630,37 +680,63 @@ def render_app():
 
     col1, col2 = st.columns(2)
     with col1:
-        pdf_file = st.file_uploader("1. PDF de tráfico (NOP / ARCID)", type=["pdf"])
+        pdf_file = st.file_uploader("1. PDF de tráfico (NOP / ARCID)", type=["pdf"], key="pdf_uploader")
     with col2:
-        xlsx_file = st.file_uploader("2. Excel maestro (Objetivos SAFA/SACA/SANA)", type=["xlsx"])
+        xlsx_file = st.file_uploader("2. Excel maestro (Objetivos SAFA/SACA/SANA)", type=["xlsx"], key="xlsx_uploader")
 
-    run = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
-    if not run:
+    run_clicked = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
+
+    # FIX: Streamlit buttons only return True on the exact rerun triggered by
+    # the click. Any later interaction (clicking "Ver vuelos no detectados",
+    # touching a filter widget, etc.) triggers a rerun where the button value
+    # goes back to False. The previous code did `if not run: return`, which
+    # wiped the whole screen back to the upload prompt on every such
+    # interaction — this is the "resets the system" bug. We now persist the
+    # processed result in st.session_state so it survives reruns, and only
+    # recompute when the button is actually clicked (or a new PDF is loaded).
+    if run_clicked:
+        pdf_bytes = pdf_file.read()
+        xlsx_bytes = xlsx_file.read()
+        flights_df = parse_pdf_flights(pdf_bytes)
+        maps = build_master_maps(xlsx_bytes)
+        result_df = enrich_flights(flights_df, maps)
+        raw_candidates_df = extract_raw_arcid_candidates(pdf_bytes)
+        expected_total = extract_expected_total(pdf_bytes)
+        st.session_state["result_df"] = result_df
+        st.session_state["raw_candidates_df"] = raw_candidates_df
+        st.session_state["expected_total"] = expected_total
+        st.session_state["fecha_str"] = datetime.now().strftime("%Y%m%d")
+
+    if "result_df" not in st.session_state:
         st.info("Sube ambos archivos y pulsa 'Generar cruce' para empezar.")
         return
 
-    pdf_bytes = pdf_file.read()
-    xlsx_bytes = xlsx_file.read()
-    flights_df = parse_pdf_flights(pdf_bytes)
-    maps = build_master_maps(xlsx_bytes)
-    result_df = enrich_flights(flights_df, maps)
-    raw_candidates_df = extract_raw_arcid_candidates(pdf_bytes)
-    expected_total = extract_expected_total(pdf_bytes)
-    fecha_str = datetime.now().strftime("%Y%m%d")
+    result_df = st.session_state["result_df"]
+    raw_candidates_df = st.session_state["raw_candidates_df"]
+    expected_total = st.session_state["expected_total"]
+    fecha_str = st.session_state["fecha_str"]
 
     st.success(f"Cruce completado con {len(result_df)} vuelos procesados.")
     if expected_total is not None:
         missing = max(expected_total - len(result_df), 0)
         coverage = (len(result_df) / expected_total * 100) if expected_total else 0
         st.caption(f"Cobertura: {len(result_df)} / {expected_total} vuelos ({coverage:.1f}%). Faltantes estimados: {missing}.")
-        if missing > 0 and not raw_candidates_df.empty and st.button("Ver vuelos no detectados"):
-            detected_arcids = set(result_df["ARCID"].astype(str).str.upper())
-            raw_candidates_df["ARCID_norm"] = raw_candidates_df["ARCID_guess"].astype(str).str.upper()
-            no_detectados = raw_candidates_df[~raw_candidates_df["ARCID_norm"].isin(detected_arcids)]
-            if no_detectados.empty:
-                st.success("No se han encontrado vuelos adicionales sin detectar.")
-            else:
-                st.dataframe(no_detectados[["Hora", "ARCID_guess", "parsed_ok"]].rename(columns={"ARCID_guess": "ARCID (detectado en texto crudo)", "parsed_ok": "Se pudo parsear tipo/aeropuertos"}), use_container_width=True)
+        if missing > 0 and not raw_candidates_df.empty:
+            # FIX: this used to be `if st.button(...):` directly wrapping the
+            # display logic, so the results vanished on the very next rerun
+            # (e.g. touching any filter). Now we persist the toggle state too.
+            if st.button("Ver vuelos no detectados"):
+                st.session_state["show_missing"] = not st.session_state.get("show_missing", False)
+            if st.session_state.get("show_missing"):
+                detected_arcids = set(result_df["ARCID"].astype(str).str.upper())
+                raw_candidates_df = raw_candidates_df.copy()
+                raw_candidates_df["ARCID_norm"] = raw_candidates_df["ARCID_guess"].astype(str).str.upper()
+                no_detectados = raw_candidates_df[~raw_candidates_df["ARCID_norm"].isin(detected_arcids)]
+                if no_detectados.empty:
+                    st.success("No se han encontrado vuelos adicionales sin detectar.")
+                else:
+                    st.markdown(f"**{len(no_detectados)} vuelo(s) presentes en el texto del PDF pero ausentes en la tabla final:**")
+                    st.dataframe(no_detectados[["Hora", "ARCID_guess", "parsed_ok"]].rename(columns={"ARCID_guess": "ARCID (detectado en texto crudo)", "parsed_ok": "Se pudo parsear tipo/aeropuertos"}), use_container_width=True)
 
     counts = result_df["Tipo objetivo"].value_counts()
     cols = st.columns(len(counts) if len(counts) > 0 else 1)
