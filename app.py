@@ -301,84 +301,116 @@ def load_sheet(xlsx_bytes: bytes, sheetname: str, max_col: int = 60):
     return headers, body
 
 
-def fmt_date(value) -> str:
-    if value is None or value == "":
-        return ""
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d")
-    return str(value)
+def find_sheet_name(available_sheets: List[str], keywords: List[str]) -> Optional[str]:
+    """Finds the real worksheet name matching ALL keywords (case-insensitive,
+    substring match), so small naming variations in the master Excel (e.g.
+    'SANA' vs 'SANA Objectives', 'ICAO CODE' vs 'ICAO_CODE') don't crash the
+    app with a hard KeyError like `wb["SANA"]` would."""
+    normalized = {s: s.upper() for s in available_sheets}
+    for sheet, upper in normalized.items():
+        if all(kw.upper() in upper for kw in keywords):
+            return sheet
+    return None
 
 
 def build_master_maps(xlsx_bytes: bytes):
-    h_icao, r_icao = load_sheet(xlsx_bytes, "ICAO CODE", max_col=2)
-    icao_map = {}
-    for row in r_icao:
-        name, code = row[0], row[1]
-        if code is not None and name is not None:
-            icao_map[str(code).strip().upper()] = str(name).strip()
+    wb_names = openpyxl.load_workbook(BytesIO(xlsx_bytes), read_only=True, data_only=True).sheetnames
 
-    h1, r1 = load_sheet(xlsx_bytes, "Layer 1 Objectives")
-    idx1 = {h: i for i, h in enumerate(h1) if h}
-    l1_map = {}
-    for row in r1:
-        code = row[idx1.get("3LC")] if "3LC" in idx1 else None
-        if code is None:
-            continue
-        code = str(code).strip().upper()
-        l1_map[code] = {
-            "operator": row[idx1.get("Operator Name")] if "Operator Name" in idx1 else "",
-            "done": row[idx1.get("Progress")] if "Progress" in idx1 else None,
-            "objective": row[idx1.get("Mean Target")] if "Mean Target" in idx1 else None,
-            "remaining": row[idx1.get("Remaining")] if "Remaining" in idx1 else None,
-            "last": row[idx1.get("Last inspection")] if "Last inspection" in idx1 else None,
-        }
+    icao_sheet = find_sheet_name(wb_names, ["ICAO"]) or find_sheet_name(wb_names, ["CODE"])
+    l1_sheet = find_sheet_name(wb_names, ["LAYER 1"])
+    l2_sheet = find_sheet_name(wb_names, ["LAYER 2"])
+    sana_sheet = find_sheet_name(wb_names, ["SANA"])
+    matriculas_sheet = find_sheet_name(wb_names, ["MATR"]) or find_sheet_name(wb_names, ["MATRICULAS"])
 
-    h2, r2 = load_sheet(xlsx_bytes, "Layer 2 Objectives")
-    idx2 = {h: i for i, h in enumerate(h2) if h}
-    obj_key = next((k for k in idx2 if "OBJECTIVE" in str(k)), None)
-    last_sp_key = next((k for k in idx2 if "LAST INSPECTION SPAIN" in str(k)), None)
-    last_eu_key = next((k for k in idx2 if "LAST INSPECTION EUROPE" in str(k)), None)
-    l2_map = {}
-    for row in r2:
-        code = row[idx2.get("3LC")] if "3LC" in idx2 else None
-        if code is None:
-            continue
-        code = str(code).strip().upper()
-        l2_map[code] = {
-            "operator": row[idx2.get("OPERATOR L2")] if "OPERATOR L2" in idx2 else "",
-            "done": row[idx2.get("DONE")] if "DONE" in idx2 else None,
-            "objective": row[idx2.get(obj_key)] if obj_key else None,
-            "remaining": row[idx2.get("REMAINING")] if "REMAINING" in idx2 else None,
-            "last": (row[idx2.get(last_sp_key)] if last_sp_key else None) or (row[idx2.get(last_eu_key)] if last_eu_key else None),
-        }
+    missing = [
+        label for label, sheet in [
+            ("ICAO CODE", icao_sheet), ("Layer 1 Objectives", l1_sheet),
+            ("Layer 2 Objectives", l2_sheet), ("SANA Objectives", sana_sheet),
+            ("Matrículas", matriculas_sheet),
+        ] if sheet is None
+    ]
+    if missing:
+        st.warning(
+            "No se encontraron en el Excel maestro las siguientes hojas esperadas: "
+            + ", ".join(missing)
+            + ". Hojas disponibles: " + ", ".join(wb_names)
+            + ". Esas fuentes se omitirán del cruce, pero la app seguirá funcionando."
+        )
 
-    hs, rs = load_sheet(xlsx_bytes, "SANA")
-    idxs = {h: i for i, h in enumerate(hs) if h}
-    sana_map = {}
-    for row in rs:
-        code = row[idxs.get("3LC")] if "3LC" in idxs else None
-        if code is None:
-            continue
-        code = str(code).strip().upper()
-        sana_map[code] = {
-            "operator": row[idxs.get("Operator Name")] if "Operator Name" in idxs else "",
-            "done": row[idxs.get("Inspections 2026")] if "Inspections 2026" in idxs else None,
-            "objective": row[idxs.get("Objective 2026")] if "Objective 2026" in idxs else None,
-            "remaining": row[idxs.get("Remaining inspections")] if "Remaining inspections" in idxs else None,
-            "last": row[idxs.get("Last Inspection Date")] if "Last Inspection Date" in idxs else None,
-        }
+    icao_map: Dict[str, str] = {}
+    if icao_sheet:
+        h_icao, r_icao = load_sheet(xlsx_bytes, icao_sheet, max_col=2)
+        for row in r_icao:
+            name, code = row[0], row[1]
+            if code is not None and name is not None:
+                icao_map[str(code).strip().upper()] = str(name).strip()
 
-    hm, rm = load_sheet(xlsx_bytes, "Matrículas", max_col=10)
-    idxm = {h: i for i, h in enumerate(hm) if h}
-    matriculas_map = {}
-    reg_key = next((k for k in idxm if str(k).strip().lower() in ["matricula", "matrícula", "registration"]), None)
-    op_key = next((k for k in idxm if "operator" in str(k).strip().lower()), None)
-    if reg_key and op_key:
-        for row in rm:
-            reg = row[idxm.get(reg_key)]
-            op = row[idxm.get(op_key)]
-            if reg and op:
-                matriculas_map[str(reg).strip().upper()] = str(op).strip()
+    l1_map: Dict[str, dict] = {}
+    if l1_sheet:
+        h1, r1 = load_sheet(xlsx_bytes, l1_sheet)
+        idx1 = {h: i for i, h in enumerate(h1) if h}
+        for row in r1:
+            code = row[idx1.get("3LC")] if "3LC" in idx1 else None
+            if code is None:
+                continue
+            code = str(code).strip().upper()
+            l1_map[code] = {
+                "operator": row[idx1.get("Operator Name")] if "Operator Name" in idx1 else "",
+                "done": row[idx1.get("Progress")] if "Progress" in idx1 else None,
+                "objective": row[idx1.get("Mean Target")] if "Mean Target" in idx1 else None,
+                "remaining": row[idx1.get("Remaining")] if "Remaining" in idx1 else None,
+                "last": row[idx1.get("Last inspection")] if "Last inspection" in idx1 else None,
+            }
+
+    l2_map: Dict[str, dict] = {}
+    if l2_sheet:
+        h2, r2 = load_sheet(xlsx_bytes, l2_sheet)
+        idx2 = {h: i for i, h in enumerate(h2) if h}
+        obj_key = next((k for k in idx2 if "OBJECTIVE" in str(k)), None)
+        last_sp_key = next((k for k in idx2 if "LAST INSPECTION SPAIN" in str(k)), None)
+        last_eu_key = next((k for k in idx2 if "LAST INSPECTION EUROPE" in str(k)), None)
+        for row in r2:
+            code = row[idx2.get("3LC")] if "3LC" in idx2 else None
+            if code is None:
+                continue
+            code = str(code).strip().upper()
+            l2_map[code] = {
+                "operator": row[idx2.get("OPERATOR L2")] if "OPERATOR L2" in idx2 else "",
+                "done": row[idx2.get("DONE")] if "DONE" in idx2 else None,
+                "objective": row[idx2.get(obj_key)] if obj_key else None,
+                "remaining": row[idx2.get("REMAINING")] if "REMAINING" in idx2 else None,
+                "last": (row[idx2.get(last_sp_key)] if last_sp_key else None) or (row[idx2.get(last_eu_key)] if last_eu_key else None),
+            }
+
+    sana_map: Dict[str, dict] = {}
+    if sana_sheet:
+        hs, rs = load_sheet(xlsx_bytes, sana_sheet)
+        idxs = {h: i for i, h in enumerate(hs) if h}
+        for row in rs:
+            code = row[idxs.get("3LC")] if "3LC" in idxs else None
+            if code is None:
+                continue
+            code = str(code).strip().upper()
+            sana_map[code] = {
+                "operator": row[idxs.get("Operator Name")] if "Operator Name" in idxs else "",
+                "done": row[idxs.get("Inspections 2026")] if "Inspections 2026" in idxs else None,
+                "objective": row[idxs.get("Objective 2026")] if "Objective 2026" in idxs else None,
+                "remaining": row[idxs.get("Remaining inspections")] if "Remaining inspections" in idxs else None,
+                "last": row[idxs.get("Last Inspection Date")] if "Last Inspection Date" in idxs else None,
+            }
+
+    matriculas_map: Dict[str, str] = {}
+    if matriculas_sheet:
+        hm, rm = load_sheet(xlsx_bytes, matriculas_sheet, max_col=10)
+        idxm = {h: i for i, h in enumerate(hm) if h}
+        reg_key = next((k for k in idxm if str(k).strip().lower() in ["matricula", "matrícula", "registration"]), None)
+        op_key = next((k for k in idxm if "operator" in str(k).strip().lower()), None)
+        if reg_key and op_key:
+            for row in rm:
+                reg = row[idxm.get(reg_key)]
+                op = row[idxm.get(op_key)]
+                if reg and op:
+                    matriculas_map[str(reg).strip().upper()] = str(op).strip()
 
     return icao_map, l1_map, l2_map, sana_map, matriculas_map
 
@@ -408,6 +440,14 @@ def cross_reference(row: pd.Series, maps) -> CrossResult:
         item = l2_map[prefix3]
         return CrossResult("Layer 2", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 2")
     return CrossResult("No encontrado", operador, None, None, None, "", fuente_operador)
+
+
+def fmt_date(value) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
 
 
 def enrich_flights(df: pd.DataFrame, maps) -> pd.DataFrame:
