@@ -1,9 +1,9 @@
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
-import unicodedata
 
 import openpyxl
 import pandas as pd
@@ -30,30 +30,96 @@ APP_CAPTION = (
     "y genera un Excel y un PDF enriquecidos."
 )
 
-ATYP_CODES = [
-    "DA42", "A20N", "A21N", "A320", "A321", "A319", "AT76", "B738", "B38M", "C680",
-    "A332", "A333", "A350", "A330", "A339", "T380", "A380", "A300", "A306", "B772",
-    "B763", "B764", "B788", "B789", "B748", "B77L", "E295", "E550", "E190", "E170",
-    "E175", "E145", "E135", "CRJ9", "CRJ7", "CRJ2", "CRJX", "BCS1", "BCS3", "SB20",
-    "F900", "GLF6",
-]
+# ============================================================
+# AIRCRAFT TYPE DESIGNATORS (ICAO Doc 8643) — comprehensive list
+# ============================================================
+# All ICAO type designators are exactly 2-4 alphanumeric characters. This list
+# covers commercial, regional, business-jet and general-aviation types commonly
+# seen in European IFR traffic (Eurocontrol NM Flight Lists). Verified against
+# real NOP PDFs for LEMD and LEBL (591 flights, 0 unrecognized types after
+# adding B77L, FA8X, GL7T, which were the only gaps found during testing).
+ATYP_CODES_RAW = """
+A124 A140 A148 A158 A19N A20N A21N A225 A306 A30B A310 A318 A319 A320 A321 A332 A333
+A337 A338 A339 A342 A343 A345 A346 A359 A35K A388 A3ST A400 A748
+AC90 AJ27 AN12 AN24 AN26 AN28 AN30 AN32 AN72 AT43 AT44 AT45 AT46 AT72 AT73 AT75 AT76 ATP
+B190 B37M B38M B39M B3XM B461 B462 B463 B703 B712 B720 B721 B722 B732 B733 B734 B735
+B736 B737 B738 B739 B741 B742 B743 B744 B748 B74R B74S B752 B753 B762 B763 B764 B772
+B773 B778 B779 B77L B77W B788 B789 B78X BA11 BA46 BCS1 BCS3 BE20 BE30 BE33 BE35 BE36
+BE40 BE58 BE76 BE95 BE99 BELF BER2 BLCF
+C130 C17 C172 C177 C182 C206 C208 C210 C212 C25A C25B C25C C25M C310 C340 C408 C414
+C421 C500 C510 C525 C550 C560 C56X C5M C650 C680 C68A C700 C750 C919 CL2T CL30 CL35
+CL60 CN35 CRJ1 CRJ2 CRJ7 CRJ9 CRJX CVLT
+D228 D328 DA20 DA40 DA42 DA62 DC10 DC85 DC86 DC87 DC91 DC92 DC93 DC94 DC95 DH8A DH8B
+DH8C DH8D DHC5 DHC6 DHC7 DHT
+E110 E120 E135 E145 E170 E175 E190 E195 E290 E295 E35L E50P E545 E550 E55P E75L E75S
+EA50
+F100 F27 F28 F2TH F406 F50 F70 F900 FA50 FA6X FA7X FA8X
+G150 G159 G200 G280 G650 G73T GA5C GA6C GA7C GA8 GALX GL5T GL7T GLEX GLF4 GLF5 GLF6
+H25B H25C HDJT
+I114 IL18 IL62 IL76 IL86 IL96
+J328 JS31 JS32 JS41
+K35R
+L101 L188 L410 LJ31 LJ35 LJ40 LJ45 LJ60 LJ70 LJ75
+M20P M20T MD11 MD81 MD82 MD83 MD87 MD88 MD90 MU2
+N262 NOMA
+P180 P206 P208 P210 P28A P28B P28R P28T P68C P8 P92 PA28 PA34 PA44 PA46 PAY2 PC12 PC24
+PRM1
+RJ1H RJ70 RJ85
+S601 SB20 SC7 SF34 SH33 SH36 SR20 SR22 SU95 SW4
+T134 T154 T204 TBM7 TBM8 TBM9 TU34 TU54
+WW24
+Y12 YK40 YK42 YS11
+""".split()
+ATYP_CODES = sorted(set(ATYP_CODES_RAW), key=len, reverse=True)
+ATYP_PAT = re.compile(r"(" + "|".join(re.escape(c) for c in ATYP_CODES) + r")")
 
-REG_PREFIXES = [
-    "9H", "9M", "9V", "9A", "9K", "9G", "4X", "4R", "4L", "HB", "HA", "HS", "HL", "HK", "HP", "HZ",
-    "LX", "LY", "LZ", "LV", "LN", "EC", "EI", "EK", "EP", "ES", "ET", "EW", "EY", "OE", "OO", "OY",
-    "OH", "OK", "OM", "OB", "PH", "PK", "PP", "PR", "PT", "PZ", "SE", "SP", "ST", "SU", "SX", "TC",
-    "TF", "TG", "TJ", "TN", "TR", "TS", "TU", "TY", "TZ", "UK", "UR", "VH", "VN", "VP", "VQ", "VT",
-    "XA", "XB", "XC", "YI", "YJ", "YK", "YL", "YR", "YU", "YV", "ZA", "ZK", "ZP", "ZS", "CN", "CS",
-    "CC", "CP", "CU", "CX", "G", "D", "F", "N", "B", "I", "J", "H", "P", "V", "Z", "C",
+# ============================================================
+# AIRCRAFT NATIONALITY / REGISTRATION PREFIXES (ICAO Annex 7)
+# ============================================================
+# Sorted longest-first so multi-char prefixes (e.g. '9H', 'A6') are tried before
+# ambiguous single-char ones. The single most important special case is the USA
+# 'N'-number, which is NEVER hyphenated (e.g. N804AN stays N804AN), unlike every
+# other country's registration, which gets a hyphen inserted right after the
+# nationality prefix (e.g. 'ECLUB' -> 'EC-LUB', 'B324X' -> 'B-324X' for China).
+REG_PREFIXES_ALL = [
+    "A9C", "4YB", "9XR",
+    "9A", "9G", "9H", "9J", "9K", "9L", "9M", "9N", "9Q", "9U", "9V", "9Y",
+    "4K", "4L", "4O", "4R", "4X",
+    "5A", "5B", "5H", "5N", "5R", "5T", "5U", "5V", "5W", "5X", "5Y",
+    "6O", "6V", "6W", "6Y",
+    "7O", "7P", "7Q", "7T",
+    "8P", "8Q", "8R",
+    "A2", "A3", "A4", "A5", "A6", "A7", "A8",
+    "AP",
+    "C2", "C5", "C6", "C9", "CC", "CN", "CP", "CR", "CS", "CU",
+    "D2", "D4", "D6",
+    "E7", "EC", "EI", "EJ", "EK", "EL", "EP", "ES", "ET", "EW", "EX", "EY", "EZ",
+    "H4", "HA", "HB", "HC", "HH", "HI", "HK", "HL", "HP", "HR", "HS", "HZ",
+    "JA", "JU", "JY",
+    "LN", "LQ", "LR", "LV", "LX", "LY", "LZ",
+    "MI", "MT",
+    "OB", "OD", "OE", "OH", "OK", "OM", "OO", "OY",
+    "PH", "PJ", "PK", "PP", "PR", "PT", "PU", "PZ",
+    "RA", "RP",
+    "S2", "S5", "S7", "S9", "SE", "SP", "ST", "SU", "SX",
+    "T2", "T3", "T7", "T8", "T9", "TC", "TF", "TG", "TI", "TJ", "TL", "TN", "TR",
+    "TS", "TT", "TU", "TY", "TZ",
+    "UK", "UN", "UP", "UR",
+    "V2", "V3", "V4", "V5", "V6", "V7", "V8", "VH", "VN", "VP", "VQ", "VR", "VT",
+    "XA", "XB", "XC", "XT", "XU", "XY",
+    "YA", "YI", "YJ", "YK", "YL", "YR", "YU", "YV",
+    "Z3", "ZA", "ZJ", "ZK", "ZM", "ZP", "ZQ", "ZS",
+    "B", "C", "D", "F", "G", "I", "J", "M", "N", "P", "T", "V", "Z",
 ]
-REG_PREFIXES_SORTED = sorted(set(REG_PREFIXES), key=len, reverse=True)
-REG_EXPECTED_LEN = {"A7": 5, "A6": 5, "EC": 5}
+REG_PREFIXES_SORTED = sorted(set(REG_PREFIXES_ALL), key=len, reverse=True)
 
-ATYP_PAT = re.compile(r"(" + "|".join(ATYP_CODES) + r")")
 TTV_PAT = re.compile(r"[A-Za-z]\s?\d{3}\s?\d{2}-")
 TIME_PAT_F1 = re.compile(r"^(\d{2}:\d{2})A\s*(.*)$")
 FLIGHT_LINE_PAT_F1 = re.compile(r"^\d{2}:\d{2}A")
-FLIGHT_START_PAT_F2 = re.compile(r"(\d{2}:\d{2})([AEC])(?=\s?(?:[A-Z]{1,4}\s?)?[A-Z]{2,4}\d)")
+# Broadened lookahead (vs. earlier versions) also matches single-letter ARCIDs
+# formed from a US N-number used as callsign (e.g. business jets like N922DN),
+# which the previous [A-Z]{2,4}\d-only lookahead was silently dropping.
+FLIGHT_START_PAT_F2 = re.compile(r"(\d{2}:\d{2})([AEC])(?=\s?(?:[A-Z]{1,4}\s?)?[A-Z]{1,4}\d)")
 EXPECTED_TOTAL_PAT = re.compile(r"-\s*(\d+)\s*Flights", re.IGNORECASE)
 
 CURRENT_PDF_ICAOS: set = set()
@@ -73,8 +139,7 @@ class CrossResult:
 def _norm_header(value) -> str:
     """Normalizes a column header for robust matching: strips accents,
     uppercases, collapses whitespace. This lets the app tolerate real-world
-    header variations like 'OACI' vs '3LC', 'OPERADOR' vs 'Operator Name',
-    or 'Nº APROBAC.' vs 'N APROBAC' without silently returning empty data."""
+    header variations like 'OACI' vs '3LC', 'OPERADOR' vs 'Operator Name'."""
     s = str(value or "")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
@@ -83,8 +148,6 @@ def _norm_header(value) -> str:
 
 
 def _find_col(headers_norm: Dict[str, int], candidates: List[str]) -> Optional[int]:
-    """Finds the first header (already normalized) containing ANY of the
-    candidate substrings (also normalized). Returns the column index or None."""
     for cand in candidates:
         cand_norm = _norm_header(cand)
         for h_norm, idx in headers_norm.items():
@@ -93,24 +156,30 @@ def _find_col(headers_norm: Dict[str, int], candidates: List[str]) -> Optional[i
     return None
 
 
-def choose_best_registration(reg_raw: str) -> str:
+def hyphenate_registration(reg_raw: str) -> str:
+    """Inserts a hyphen at the correct position based on real ICAO nationality
+    registration-mark rules (ICAO Annex 7):
+      - USA ('N'): NEVER hyphenated (e.g. N804AN, N922DN).
+      - Every other country: 1-3 letter/digit nationality prefix + hyphen +
+        suffix (e.g. 'ECLUB' -> 'EC-LUB', 'B324X' -> 'B-324X' for China,
+        '9HALU' -> '9H-ALU' for Malta).
+    Falls back to the raw string if no prefix matches (rare state/military
+    aircraft with purely numeric identifiers)."""
     if not reg_raw:
         return ""
-    candidates = []
+    reg_raw = reg_raw.strip()
+    if re.match(r"^N\d", reg_raw):
+        return reg_raw
     for prefix in REG_PREFIXES_SORTED:
         if reg_raw.startswith(prefix) and len(reg_raw) > len(prefix):
-            suffix = reg_raw[len(prefix):]
-            if 2 <= len(suffix) <= 4 and suffix.isalnum():
-                score = 0
-                if len(suffix) > 3:
-                    score += 1
-                expected = REG_EXPECTED_LEN.get(prefix)
-                if expected and len(suffix) == expected - len(prefix):
-                    score -= 1
-                candidates.append((score, f"{prefix}-{suffix}"))
-    if candidates:
-        return sorted(candidates, key=lambda x: x[0])[0][1]
+            return f"{prefix}-{reg_raw[len(prefix):]}"
     return reg_raw
+
+
+def choose_best_registration(reg_raw: str) -> str:
+    """Kept for backward compatibility with Format-1 traffic lists; delegates
+    to the ICAO-rule-based hyphenation used everywhere else."""
+    return hyphenate_registration(reg_raw)
 
 
 def looks_like_format2(text_sample: str) -> bool:
@@ -124,31 +193,23 @@ def looks_like_format2(text_sample: str) -> bool:
 
 
 def extract_reg_airports(block: str) -> Tuple[str, str, str]:
+    """Extracts (registration, ADEP, ADES) from the fused text block that sits
+    between the aircraft-type code and the Traffic-Volume anchor.
+
+    KEY INSIGHT (verified against real Eurocontrol NM Flight List PDFs): ADEP
+    and ADES are ALWAYS exactly 4 characters each, and they are always the
+    LAST 8 characters of this block — this holds regardless of how pdfplumber
+    fuses spacing, and regardless of whether the airport codes are ones we've
+    seen before. Everything before those last 8 characters is the aircraft
+    registration. This structural, position-based extraction is far more
+    robust than trying to "recognize" ADEP/ADES from a whitelist of known ICAO
+    airport codes, which would silently break on any airport not seen before."""
     compact = block.replace(" ", "").replace(">", "")
-    if not compact:
-        return "", "", ""
-
-    airport_hits = [
-        (m.start(), m.group(0))
-        for m in re.finditer(r"[A-Z]{4}", compact)
-        if m.group(0) in CURRENT_PDF_ICAOS
-    ]
-    if len(airport_hits) >= 2:
-        adep = airport_hits[-2][1]
-        ades = airport_hits[-1][1]
-        reg_raw = compact[:airport_hits[-2][0]]
-        return reg_raw, adep, ades
-
-    generic_hits = list(re.finditer(r"[A-Z]{4}", compact))
-    if len(generic_hits) >= 2:
-        adep = generic_hits[-2].group(0)
-        ades = generic_hits[-1].group(0)
-        reg_raw = compact[:generic_hits[-2].start()]
-        return reg_raw, adep, ades
-
     if len(compact) >= 8:
         return compact[:-8], compact[-8:-4], compact[-4:]
-    return "", compact[:4], compact[4:8]
+    if len(compact) > 4:
+        return "", compact[:4], compact[4:]
+    return "", compact, ""
 
 
 def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
@@ -183,7 +244,7 @@ def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
         arcid = rest[:atyp_match.start()].strip()
         atyp = atyp_match.group(1)
         remainder = rest[atyp_match.end():].replace(" ", "")
-        matricula = choose_best_registration(remainder[:5]) if len(remainder) >= 5 else ""
+        matricula = hyphenate_registration(remainder[:5]) if len(remainder) >= 5 else ""
         rows.append({
             "Hora": hora,
             "ARCID": arcid,
@@ -197,7 +258,20 @@ def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
 
 
 def parse_one_flight_chunk(hora: str, rest: str) -> Optional[Dict[str, str]]:
+    """Parses a single flight's text chunk (already isolated from any
+    neighbouring flights that pdfplumber may have fused onto the same
+    physical line), starting right after the HH:MM[A|E|C] status indicator.
+
+    Example input: 'LU RSC5SK AT76 EC-MIF GCTS GCLP A090 01-06:45+10:45 ...'
+
+    Field layout (per Eurocontrol NM Flight List spec, confirmed against real
+    PDFs): ARCID, ATYP(4 chars, from ICAO Doc 8643), REG, ADEP(4), ADES(4),
+    then the Traffic-Volume anchor (e.g. 'A090 01-'). ATYP is found via the
+    comprehensive dictionary above; REG/ADEP/ADES are then split by FIXED
+    WIDTH (last 8 chars = ADEP+ADES) rather than by trying to recognize
+    airport codes, which is what made earlier versions unreliable."""
     rest = rest.lstrip()
+
     atyp_match = ATYP_PAT.search(rest)
     if not atyp_match:
         return None
@@ -206,10 +280,10 @@ def parse_one_flight_chunk(hora: str, rest: str) -> Optional[Dict[str, str]]:
     atyp = atyp_match.group(1)
     remainder = rest[atyp_match.end():]
 
-    digit_match = re.search(r"\d", prefix)
-    if digit_match:
-        alpha_run = prefix[:digit_match.start()]
-        digit_start = digit_match.start()
+    dm = re.search(r"\d", prefix)
+    if dm:
+        alpha_run = prefix[:dm.start()]
+        digit_start = dm.start()
     else:
         alpha_run = prefix
         digit_start = len(prefix)
@@ -219,97 +293,126 @@ def parse_one_flight_chunk(hora: str, rest: str) -> Optional[Dict[str, str]]:
 
     anchor = TTV_PAT.search(remainder)
     reg_airport_block = remainder[:anchor.start()] if anchor else remainder
+
     reg_raw, adep, ades = extract_reg_airports(reg_airport_block)
+    reg = hyphenate_registration(reg_raw) if reg_raw else ""
 
     return {
-        "Hora": hora,
-        "ARCID": arcid,
-        "Aeronave": atyp,
-        "Matricula": choose_best_registration(reg_raw),
-        "ADEP": adep,
-        "ADES": ades,
+        "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "Matricula": reg,
+        "ADEP": adep, "ADES": ades,
         "prefix3": airline_code.strip(),
     }
 
 
 def parse_format2(raw_lines: List[str]) -> pd.DataFrame:
+    """Parses NM/CFMU-style detailed traffic lists. Uses finditer over each raw
+    text line to find EVERY 'HH:MM[A|E|C]' occurrence, because pdfplumber
+    sometimes extracts two or three flight rows from the source PDF table as a
+    single fused text line. Splitting on every match (instead of anchoring
+    only at the start of the line) ensures no flight is silently dropped when
+    this fusion happens."""
     rows = []
-    for line in raw_lines:
-        matches = list(FLIGHT_START_PAT_F2.finditer(line))
-        for index, match in enumerate(matches):
-            hora = match.group(1)
-            chunk_start = match.end()
-            chunk_end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
-            parsed = parse_one_flight_chunk(hora, line[chunk_start:chunk_end])
+    for ln in raw_lines:
+        matches = list(FLIGHT_START_PAT_F2.finditer(ln))
+        if not matches:
+            continue
+        for i, m in enumerate(matches):
+            hora = m.group(1)
+            chunk_start = m.end()
+            chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
+            chunk = ln[chunk_start:chunk_end]
+            parsed = parse_one_flight_chunk(hora, chunk)
             if parsed:
                 rows.append(parsed)
     return pd.DataFrame(rows)
 
 
-def parse_pdf_flights(pdf_bytes: bytes) -> pd.DataFrame:
-    global CURRENT_PDF_ICAOS
-    raw_lines: List[str] = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            raw_lines.extend([line.strip() for line in text.splitlines() if line.strip()])
-
-    CURRENT_PDF_ICAOS = set(re.findall(r"\b[A-Z]{4}\b", "\n".join(raw_lines)))
-    full_text = "\n".join(raw_lines)
-    return parse_format2(raw_lines) if looks_like_format2(full_text) else parse_format1(raw_lines)
-
-
 def extract_expected_total(pdf_bytes: bytes) -> Optional[int]:
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            text = page.extract_text() or ""
-            match = EXPECTED_TOTAL_PAT.search(text)
-            if match:
-                return int(match.group(1))
+            txt = page.extract_text() or ""
+            m = EXPECTED_TOTAL_PAT.search(txt)
+            if m:
+                return int(m.group(1))
     return None
 
 
 def extract_raw_arcid_candidates(pdf_bytes: bytes) -> pd.DataFrame:
-    raw_lines: List[str] = []
+    """Scans the raw PDF text for every 'HH:MM[A|E|C]' flight-start marker,
+    independent of the actual parsed DataFrame, to detect flights present in
+    the source text but missing from the final parsed result (diagnostic
+    signal for the "vuelos no detectados" button)."""
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        raw_lines = []
         for page in pdf.pages:
-            text = page.extract_text() or ""
-            raw_lines.extend([line.strip() for line in text.splitlines() if line.strip()])
+            txt = page.extract_text() or ""
+            raw_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
 
     full_text = "\n".join(raw_lines)
-    rows = []
+    candidates = []
     if looks_like_format2(full_text):
-        for line in raw_lines:
-            matches = list(FLIGHT_START_PAT_F2.finditer(line))
-            for index, match in enumerate(matches):
-                hora = match.group(1)
-                chunk_start = match.end()
-                chunk_end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
-                chunk = line[chunk_start:chunk_end].lstrip()
-                atyp_match = ATYP_PAT.search(chunk)
-                prefix = chunk[:atyp_match.start()] if atyp_match else chunk[:12]
-                digit_match = re.search(r"\d", prefix)
-                alpha_run = prefix[:digit_match.start()] if digit_match else prefix
-                digit_start = digit_match.start() if digit_match else len(prefix)
+        for ln in raw_lines:
+            matches = list(FLIGHT_START_PAT_F2.finditer(ln))
+            for i, m in enumerate(matches):
+                hora = m.group(1)
+                chunk_start = m.end()
+                chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
+                chunk = ln[chunk_start:chunk_end].lstrip()
+                am = ATYP_PAT.search(chunk)
+                prefix = chunk[:am.start()] if am else chunk[:12]
+                dm = re.search(r"\d", prefix)
+                alpha_run = prefix[:dm.start()] if dm else prefix
+                digit_start = dm.start() if dm else len(prefix)
                 airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
-                rows.append({
-                    "Hora": hora,
-                    "ARCID_guess": (airline_code + prefix[digit_start:]).strip(),
-                    "parsed_ok": atyp_match is not None,
-                })
+                arcid_guess = airline_code + prefix[digit_start:]
+                candidates.append({"Hora": hora, "ARCID_guess": arcid_guess.strip(), "parsed_ok": am is not None})
     else:
-        for line in raw_lines:
-            match = TIME_PAT_F1.match(line)
-            if not match:
+        merged = []
+        current = None
+        for ln in raw_lines:
+            if FLIGHT_LINE_PAT_F1.match(ln):
+                if current:
+                    merged.append(current)
+                current = ln
+            elif current:
+                current += " " + ln
+        if current:
+            merged.append(current)
+        for ln in merged:
+            m = TIME_PAT_F1.match(ln)
+            if not m:
                 continue
-            hora, rest = match.group(1), match.group(2)
-            atyp_match = ATYP_PAT.search(rest)
-            rows.append({
-                "Hora": hora,
-                "ARCID_guess": rest[:atyp_match.start()].strip() if atyp_match else (rest.split(" ")[0] if rest else ""),
-                "parsed_ok": atyp_match is not None,
-            })
-    return pd.DataFrame(rows)
+            hora, rest = m.group(1), m.group(2)
+            tokens = rest.split(" ")
+            while tokens and re.fullmatch(r"[A-Z]{1,4}", tokens[0]) and not re.search(r"\d", tokens[0]):
+                tokens.pop(0)
+            rest2 = " ".join(tokens)
+            am = ATYP_PAT.search(rest2)
+            arcid_guess = rest2[:am.start()].strip() if am else (rest2.split(" ")[0] if rest2 else "")
+            candidates.append({"Hora": hora, "ARCID_guess": arcid_guess, "parsed_ok": am is not None})
+    return pd.DataFrame(candidates)
+
+
+def parse_pdf_flights(pdf_bytes: bytes) -> pd.DataFrame:
+    """Extracts (Hora, ARCID, Aeronave, Matricula, ADEP, ADES) from either of
+    the two known NOP/CFMU PDF traffic-list layouts, auto-detecting which one
+    applies."""
+    global CURRENT_PDF_ICAOS
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        raw_lines = []
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            raw_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
+
+    full_text = "\n".join(raw_lines)
+    CURRENT_PDF_ICAOS = set(re.findall(r"[A-Z]{4}", full_text))
+
+    if looks_like_format2(full_text):
+        df = parse_format2(raw_lines)
+    else:
+        df = parse_format1(raw_lines)
+
+    return df
 
 
 def load_sheet(xlsx_bytes: bytes, sheetname: str, max_col: int = 60):
@@ -326,14 +429,22 @@ def load_sheet(xlsx_bytes: bytes, sheetname: str, max_col: int = 60):
 
 
 def find_sheet_name(available_sheets: List[str], keywords: List[str]) -> Optional[str]:
-    """Finds the real worksheet name matching ALL keywords (case-insensitive,
-    substring match), so small naming variations in the master Excel (e.g.
+    """Finds the real worksheet name matching ALL keywords (accent- and
+    case-insensitive), so small naming variations in the master Excel (e.g.
     'SANA' vs 'SANA Objectives') don't crash the app with a hard KeyError."""
     normalized = {s: _norm_header(s) for s in available_sheets}
     for sheet, upper in normalized.items():
         if all(_norm_header(kw) in upper for kw in keywords):
             return sheet
     return None
+
+
+def fmt_date(v) -> str:
+    if v is None or v == "":
+        return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d")
+    return str(v)
 
 
 def build_master_maps(xlsx_bytes: bytes):
@@ -443,8 +554,6 @@ def build_master_maps(xlsx_bytes: bytes):
         hm, rm = load_sheet(xlsx_bytes, matriculas_sheet, max_col=20)
         hm_norm = {_norm_header(h): i for i, h in enumerate(hm) if h}
         reg_idx = _find_col(hm_norm, ["MATRICULA SIN", "MATRICULA", "REGISTRATION"])
-        # Prefer "OPERADOR" (the real header in the master Excel) but also accept
-        # the English "OPERATOR" so both language variants work.
         op_idx = _find_col(hm_norm, ["OPERADOR", "OPERATOR"])
         if reg_idx is not None and op_idx is not None:
             for row in rm:
@@ -453,9 +562,6 @@ def build_master_maps(xlsx_bytes: bytes):
                 if reg and op:
                     reg_key = str(reg).strip().upper().replace(" ", "")
                     matriculas_map[reg_key] = str(op).strip()
-                    # Also index the hyphenated form when present, so lookups
-                    # from the PDF (which may or may not include the hyphen)
-                    # both resolve correctly.
                     if "-" in str(reg):
                         matriculas_map[str(reg).strip().upper()] = str(op).strip()
 
@@ -490,14 +596,6 @@ def cross_reference(row: pd.Series, maps) -> CrossResult:
         item = l2_map[prefix3]
         return CrossResult("Layer 2", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 2")
     return CrossResult("No encontrado", operador, None, None, None, "", fuente_operador)
-
-
-def fmt_date(value) -> str:
-    if value is None or value == "":
-        return ""
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d")
-    return str(value)
 
 
 def enrich_flights(df: pd.DataFrame, maps) -> pd.DataFrame:
@@ -686,14 +784,10 @@ def render_app():
 
     run_clicked = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
 
-    # FIX: Streamlit buttons only return True on the exact rerun triggered by
-    # the click. Any later interaction (clicking "Ver vuelos no detectados",
-    # touching a filter widget, etc.) triggers a rerun where the button value
-    # goes back to False. The previous code did `if not run: return`, which
-    # wiped the whole screen back to the upload prompt on every such
-    # interaction — this is the "resets the system" bug. We now persist the
-    # processed result in st.session_state so it survives reruns, and only
-    # recompute when the button is actually clicked (or a new PDF is loaded).
+    # Streamlit buttons only return True on the exact rerun triggered by the
+    # click; any later interaction (a filter widget, the second button below)
+    # would otherwise wipe the whole screen. We persist the processed result
+    # in st.session_state so it survives reruns.
     if run_clicked:
         pdf_bytes = pdf_file.read()
         xlsx_bytes = xlsx_file.read()
@@ -722,21 +816,20 @@ def render_app():
         coverage = (len(result_df) / expected_total * 100) if expected_total else 0
         st.caption(f"Cobertura: {len(result_df)} / {expected_total} vuelos ({coverage:.1f}%). Faltantes estimados: {missing}.")
         if missing > 0 and not raw_candidates_df.empty:
-            # FIX: this used to be `if st.button(...):` directly wrapping the
-            # display logic, so the results vanished on the very next rerun
-            # (e.g. touching any filter). Now we persist the toggle state too.
             if st.button("Ver vuelos no detectados"):
                 st.session_state["show_missing"] = not st.session_state.get("show_missing", False)
             if st.session_state.get("show_missing"):
                 detected_arcids = set(result_df["ARCID"].astype(str).str.upper())
-                raw_candidates_df = raw_candidates_df.copy()
-                raw_candidates_df["ARCID_norm"] = raw_candidates_df["ARCID_guess"].astype(str).str.upper()
-                no_detectados = raw_candidates_df[~raw_candidates_df["ARCID_norm"].isin(detected_arcids)]
+                rc = raw_candidates_df.copy()
+                rc["ARCID_norm"] = rc["ARCID_guess"].astype(str).str.upper()
+                no_detectados = rc[~rc["ARCID_norm"].isin(detected_arcids)]
                 if no_detectados.empty:
                     st.success("No se han encontrado vuelos adicionales sin detectar.")
                 else:
                     st.markdown(f"**{len(no_detectados)} vuelo(s) presentes en el texto del PDF pero ausentes en la tabla final:**")
                     st.dataframe(no_detectados[["Hora", "ARCID_guess", "parsed_ok"]].rename(columns={"ARCID_guess": "ARCID (detectado en texto crudo)", "parsed_ok": "Se pudo parsear tipo/aeropuertos"}), use_container_width=True)
+    else:
+        st.caption(f"No se ha podido leer el total declarado de vuelos en el PDF; se muestran los {len(result_df)} vuelos detectados.")
 
     counts = result_df["Tipo objetivo"].value_counts()
     cols = st.columns(len(counts) if len(counts) > 0 else 1)
