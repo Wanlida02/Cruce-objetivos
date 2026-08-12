@@ -49,11 +49,6 @@ INTEGER_COLUMNS = {"Inspecciones realizadas", "Objetivo 2026", "Restantes"}
 # ============================================================
 # AIRCRAFT TYPE DESIGNATORS (ICAO Doc 8643) — comprehensive list
 # ============================================================
-# All ICAO type designators are exactly 2-4 alphanumeric characters. This list
-# covers commercial, regional, business-jet and general-aviation types commonly
-# seen in European IFR traffic (Eurocontrol NM Flight Lists). Verified against
-# real NOP PDFs for LEMD and LEBL (591 flights, 0 unrecognized types after
-# adding B77L, FA8X, GL7T, which were the only gaps found during testing).
 ATYP_CODES_RAW = """
 A124 A140 A148 A158 A19N A20N A21N A225 A306 A30B A310 A318 A319 A320 A321 A332 A333
 A337 A338 A339 A342 A343 A345 A346 A359 A35K A388 A3ST A400 A748
@@ -653,14 +648,6 @@ def enrich_flights(df: pd.DataFrame, maps) -> pd.DataFrame:
     return enriched[OUTPUT_COLUMNS + ["_discrepancia"]]
 
 
-def _fmt_cell(value):
-    """Renders ints without decimals and blanks for missing values, leaving
-    every other column type untouched."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-    return value
-
-
 def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
     wb = Workbook()
     ws = wb.active
@@ -797,7 +784,18 @@ def apply_filters(result_df: pd.DataFrame) -> pd.DataFrame:
         max_restantes = int(restantes_num.max()) if restantes_num.notna().any() else 0
         restantes_range = st.slider("Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1)), key="filtro_restantes")
     with col6:
-        solo_discrepancias = st.checkbox("Mostrar solo discrepancias (operador ≠ código de vuelo)", value=False, key="filtro_solo_disc")
+        fechas_validas = pd.to_datetime(result_df["Última inspección"], errors="coerce")
+        min_fecha = fechas_validas.min().date() if fechas_validas.notna().any() else datetime.now().date()
+        max_fecha = fechas_validas.max().date() if fechas_validas.notna().any() else datetime.now().date()
+        preset_sel = st.selectbox(
+            "Última inspección",
+            ["Todas las fechas", "Última semana", "Último mes", "No en la última semana", "No en el último mes", "Rango personalizado"],
+            index=0,
+            key="filtro_preset",
+        )
+        fecha_range = st.date_input("Rango personalizado de fechas", value=(min_fecha, max_fecha), key="filtro_fecha_range") if preset_sel == "Rango personalizado" else None
+
+    solo_discrepancias = st.checkbox("Mostrar solo discrepancias (operador ≠ código de vuelo)", value=False, key="filtro_solo_disc")
 
     filtered_df = result_df.copy()
     if texto_busqueda.strip():
@@ -816,6 +814,23 @@ def apply_filters(result_df: pd.DataFrame) -> pd.DataFrame:
 
     rest_num_full = pd.to_numeric(filtered_df["Restantes"], errors="coerce")
     filtered_df = filtered_df[rest_num_full.isna() | rest_num_full.between(restantes_range[0], restantes_range[1])]
+
+    hoy = datetime.now().date()
+    fechas_filtro = pd.to_datetime(filtered_df["Última inspección"], errors="coerce")
+    if preset_sel == "Última semana":
+        limite = hoy - pd.Timedelta(days=7)
+        filtered_df = filtered_df[fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)]
+    elif preset_sel == "Último mes":
+        limite = hoy - pd.Timedelta(days=30)
+        filtered_df = filtered_df[fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)]
+    elif preset_sel == "No en la última semana":
+        limite = hoy - pd.Timedelta(days=7)
+        filtered_df = filtered_df[fechas_filtro.isna() | (fechas_filtro.dt.date < limite)]
+    elif preset_sel == "No en el último mes":
+        limite = hoy - pd.Timedelta(days=30)
+        filtered_df = filtered_df[fechas_filtro.isna() | (fechas_filtro.dt.date < limite)]
+    elif preset_sel == "Rango personalizado" and isinstance(fecha_range, tuple) and len(fecha_range) == 2:
+        filtered_df = filtered_df[fechas_filtro.isna() | ((fechas_filtro.dt.date >= fecha_range[0]) & (fechas_filtro.dt.date <= fecha_range[1]))]
 
     if solo_discrepancias:
         filtered_df = filtered_df[filtered_df["_discrepancia"] == True]
