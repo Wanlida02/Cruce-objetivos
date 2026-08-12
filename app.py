@@ -1,4 +1,5 @@
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import openpyxl
 import pandas as pd
 import pdfplumber
+import requests
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
@@ -26,8 +28,10 @@ st.set_page_config(page_title="GCTS - Cruce Objetivos SAFA/SACA/SANA", layout="w
 APP_TITLE = "Cruce automático: Lista de tráfico (NOP) + Objetivos SAFA/SACA/SANA"
 APP_CAPTION = (
     "Sube el PDF de la lista de tráfico (NOP Eurocontrol, formato ARCID) y el Excel maestro "
-    "de Objetivos SAFA/SACA/SANA/Matrículas. La app cruza cada vuelo por el prefijo ARCID "
-    "y genera un Excel y un PDF enriquecidos."
+    "de Objetivos SAFA/SACA/SANA/Matrículas. La app busca cada matrícula en una base pública "
+    "de registros (hexdb.io) para obtener el código de operador real, y cruza ese código con "
+    "el Excel maestro. Si la matrícula no se encuentra, o si el operador externo no coincide "
+    "con el código de vuelo del PDF, la fila se marca en naranja como aviso."
 )
 
 # ============================================================
@@ -76,11 +80,6 @@ ATYP_PAT = re.compile(r"(" + "|".join(re.escape(c) for c in ATYP_CODES) + r")")
 # ============================================================
 # AIRCRAFT NATIONALITY / REGISTRATION PREFIXES (ICAO Annex 7)
 # ============================================================
-# Sorted longest-first so multi-char prefixes (e.g. '9H', 'A6') are tried before
-# ambiguous single-char ones. The single most important special case is the USA
-# 'N'-number, which is NEVER hyphenated (e.g. N804AN stays N804AN), unlike every
-# other country's registration, which gets a hyphen inserted right after the
-# nationality prefix (e.g. 'ECLUB' -> 'EC-LUB', 'B324X' -> 'B-324X' for China).
 REG_PREFIXES_ALL = [
     "A9C", "4YB", "9XR",
     "9A", "9G", "9H", "9J", "9K", "9L", "9M", "9N", "9Q", "9U", "9V", "9Y",
@@ -116,13 +115,30 @@ REG_PREFIXES_SORTED = sorted(set(REG_PREFIXES_ALL), key=len, reverse=True)
 TTV_PAT = re.compile(r"[A-Za-z]\s?\d{3}\s?\d{2}-")
 TIME_PAT_F1 = re.compile(r"^(\d{2}:\d{2})A\s*(.*)$")
 FLIGHT_LINE_PAT_F1 = re.compile(r"^\d{2}:\d{2}A")
-# Broadened lookahead (vs. earlier versions) also matches single-letter ARCIDs
-# formed from a US N-number used as callsign (e.g. business jets like N922DN),
-# which the previous [A-Z]{2,4}\d-only lookahead was silently dropping.
 FLIGHT_START_PAT_F2 = re.compile(r"(\d{2}:\d{2})([AEC])(?=\s?(?:[A-Z]{1,4}\s?)?[A-Z]{1,4}\d)")
 EXPECTED_TOTAL_PAT = re.compile(r"-\s*(\d+)\s*Flights", re.IGNORECASE)
 
 CURRENT_PDF_ICAOS: set = set()
+
+# ============================================================
+# EXTERNAL REGISTRATION LOOKUP (hexdb.io)
+# ============================================================
+# NOTE ON SOURCE: Airframes.org's Terms of Usage explicitly prohibit
+# "bots, spiders, scrapers, scripted or programmed queries or otherwise
+# automated queries" and require a negotiated license for any commercial,
+# public or official use of their data. Since this app performs exactly
+# that kind of automated, official-use lookup, calling Airframes.org
+# directly would violate their ToS and risks having the request blocked.
+#
+# hexdb.io is used instead: a free, public, no-key-required REST API
+# (https://hexdb.io) that exposes the same kind of field we need —
+# 'OperatorFlagCode', a 3-letter ICAO operator code, e.g. for G-EZBZ it
+# returns 'EZY' (easyJet), exactly analogous to the 'MAY' example given.
+# Flow: registration -> ICAO24 hex (reg-hex) -> aircraft record (api/v1/aircraft/{hex}).
+HEXDB_REG_HEX_URL = "https://hexdb.io/reg-hex"
+HEXDB_AIRCRAFT_URL = "https://hexdb.io/api/v1/aircraft/{hex}"
+HEXDB_REQUEST_TIMEOUT = 5
+HEXDB_REQUEST_DELAY = 0.25  # stay well under hexdb.io's published rate limit
 
 
 @dataclass
@@ -134,12 +150,11 @@ class CrossResult:
     restantes: Optional[object]
     ultima: str
     fuente: str
+    codigo_externo: str
+    alerta: str
 
 
 def _norm_header(value) -> str:
-    """Normalizes a column header for robust matching: strips accents,
-    uppercases, collapses whitespace. This lets the app tolerate real-world
-    header variations like 'OACI' vs '3LC', 'OPERADOR' vs 'Operator Name'."""
     s = str(value or "")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
@@ -157,14 +172,6 @@ def _find_col(headers_norm: Dict[str, int], candidates: List[str]) -> Optional[i
 
 
 def hyphenate_registration(reg_raw: str) -> str:
-    """Inserts a hyphen at the correct position based on real ICAO nationality
-    registration-mark rules (ICAO Annex 7):
-      - USA ('N'): NEVER hyphenated (e.g. N804AN, N922DN).
-      - Every other country: 1-3 letter/digit nationality prefix + hyphen +
-        suffix (e.g. 'ECLUB' -> 'EC-LUB', 'B324X' -> 'B-324X' for China,
-        '9HALU' -> '9H-ALU' for Malta).
-    Falls back to the raw string if no prefix matches (rare state/military
-    aircraft with purely numeric identifiers)."""
     if not reg_raw:
         return ""
     reg_raw = reg_raw.strip()
@@ -177,8 +184,6 @@ def hyphenate_registration(reg_raw: str) -> str:
 
 
 def choose_best_registration(reg_raw: str) -> str:
-    """Kept for backward compatibility with Format-1 traffic lists; delegates
-    to the ICAO-rule-based hyphenation used everywhere else."""
     return hyphenate_registration(reg_raw)
 
 
@@ -193,17 +198,6 @@ def looks_like_format2(text_sample: str) -> bool:
 
 
 def extract_reg_airports(block: str) -> Tuple[str, str, str]:
-    """Extracts (registration, ADEP, ADES) from the fused text block that sits
-    between the aircraft-type code and the Traffic-Volume anchor.
-
-    KEY INSIGHT (verified against real Eurocontrol NM Flight List PDFs): ADEP
-    and ADES are ALWAYS exactly 4 characters each, and they are always the
-    LAST 8 characters of this block — this holds regardless of how pdfplumber
-    fuses spacing, and regardless of whether the airport codes are ones we've
-    seen before. Everything before those last 8 characters is the aircraft
-    registration. This structural, position-based extraction is far more
-    robust than trying to "recognize" ADEP/ADES from a whitelist of known ICAO
-    airport codes, which would silently break on any airport not seen before."""
     compact = block.replace(" ", "").replace(">", "")
     if len(compact) >= 8:
         return compact[:-8], compact[-8:-4], compact[-4:]
@@ -258,18 +252,6 @@ def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
 
 
 def parse_one_flight_chunk(hora: str, rest: str) -> Optional[Dict[str, str]]:
-    """Parses a single flight's text chunk (already isolated from any
-    neighbouring flights that pdfplumber may have fused onto the same
-    physical line), starting right after the HH:MM[A|E|C] status indicator.
-
-    Example input: 'LU RSC5SK AT76 EC-MIF GCTS GCLP A090 01-06:45+10:45 ...'
-
-    Field layout (per Eurocontrol NM Flight List spec, confirmed against real
-    PDFs): ARCID, ATYP(4 chars, from ICAO Doc 8643), REG, ADEP(4), ADES(4),
-    then the Traffic-Volume anchor (e.g. 'A090 01-'). ATYP is found via the
-    comprehensive dictionary above; REG/ADEP/ADES are then split by FIXED
-    WIDTH (last 8 chars = ADEP+ADES) rather than by trying to recognize
-    airport codes, which is what made earlier versions unreliable."""
     rest = rest.lstrip()
 
     atyp_match = ATYP_PAT.search(rest)
@@ -305,12 +287,6 @@ def parse_one_flight_chunk(hora: str, rest: str) -> Optional[Dict[str, str]]:
 
 
 def parse_format2(raw_lines: List[str]) -> pd.DataFrame:
-    """Parses NM/CFMU-style detailed traffic lists. Uses finditer over each raw
-    text line to find EVERY 'HH:MM[A|E|C]' occurrence, because pdfplumber
-    sometimes extracts two or three flight rows from the source PDF table as a
-    single fused text line. Splitting on every match (instead of anchoring
-    only at the start of the line) ensures no flight is silently dropped when
-    this fusion happens."""
     rows = []
     for ln in raw_lines:
         matches = list(FLIGHT_START_PAT_F2.finditer(ln))
@@ -338,10 +314,6 @@ def extract_expected_total(pdf_bytes: bytes) -> Optional[int]:
 
 
 def extract_raw_arcid_candidates(pdf_bytes: bytes) -> pd.DataFrame:
-    """Scans the raw PDF text for every 'HH:MM[A|E|C]' flight-start marker,
-    independent of the actual parsed DataFrame, to detect flights present in
-    the source text but missing from the final parsed result (diagnostic
-    signal for the "vuelos no detectados" button)."""
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         raw_lines = []
         for page in pdf.pages:
@@ -394,9 +366,6 @@ def extract_raw_arcid_candidates(pdf_bytes: bytes) -> pd.DataFrame:
 
 
 def parse_pdf_flights(pdf_bytes: bytes) -> pd.DataFrame:
-    """Extracts (Hora, ARCID, Aeronave, Matricula, ADEP, ADES) from either of
-    the two known NOP/CFMU PDF traffic-list layouts, auto-detecting which one
-    applies."""
     global CURRENT_PDF_ICAOS
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         raw_lines = []
@@ -415,6 +384,59 @@ def parse_pdf_flights(pdf_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def hexdb_lookup_operator_code(registration: str) -> Optional[str]:
+    """Looks up a registration's 3-letter ICAO operator code via hexdb.io.
+
+    Two-step lookup (documented at https://hexdb.io/): first resolve the
+    registration to its ICAO24 Mode-S hex address, then fetch the aircraft
+    record for that hex, which includes 'OperatorFlagCode' — the 3-letter
+    operator code (e.g. 'EZY' for easyJet), analogous to the 'MAY' example
+    used to specify this feature. Returns None if the registration isn't
+    found, the hex has no matching record, or any network error occurs —
+    callers must treat None as "use the flight-number operator code instead
+    and flag the row as a warning".
+    """
+    reg = (registration or "").strip().upper()
+    if not reg:
+        return None
+    try:
+        r = requests.get(HEXDB_REG_HEX_URL, params={"reg": reg}, timeout=HEXDB_REQUEST_TIMEOUT)
+        time.sleep(HEXDB_REQUEST_DELAY)
+        if r.status_code != 200:
+            return None
+        hex_code = r.text.strip()
+        if not hex_code or "not found" in hex_code.lower() or len(hex_code) > 8:
+            return None
+        r2 = requests.get(HEXDB_AIRCRAFT_URL.format(hex=hex_code), timeout=HEXDB_REQUEST_TIMEOUT)
+        time.sleep(HEXDB_REQUEST_DELAY)
+        if r2.status_code != 200:
+            return None
+        data = r2.json()
+        code = str(data.get("OperatorFlagCode") or "").strip().upper()
+        return code or None
+    except Exception:
+        return None
+
+
+def build_external_operator_map(registrations: List[str]) -> Dict[str, Optional[str]]:
+    """Resolves every unique, non-empty registration in the flight list to
+    its hexdb.io operator code exactly once, with a progress bar (NOP lists
+    routinely contain 400-700 flights, so de-duplicating avoids redundant
+    network round-trips for aircraft that fly multiple legs the same day)."""
+    unique_regs = sorted({str(r).strip().upper() for r in registrations if str(r).strip()})
+    result: Dict[str, Optional[str]] = {}
+    if not unique_regs:
+        return result
+    progress = st.progress(0.0, text=f"Consultando hexdb.io: 0 / {len(unique_regs)} matrículas")
+    for i, reg in enumerate(unique_regs, start=1):
+        result[reg] = hexdb_lookup_operator_code(reg)
+        if i % 5 == 0 or i == len(unique_regs):
+            progress.progress(i / len(unique_regs), text=f"Consultando hexdb.io: {i} / {len(unique_regs)} matrículas")
+    progress.empty()
+    return result
+
+
 def load_sheet(xlsx_bytes: bytes, sheetname: str, max_col: int = 60):
     wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), read_only=True, data_only=True)
     ws = wb[sheetname]
@@ -429,9 +451,6 @@ def load_sheet(xlsx_bytes: bytes, sheetname: str, max_col: int = 60):
 
 
 def find_sheet_name(available_sheets: List[str], keywords: List[str]) -> Optional[str]:
-    """Finds the real worksheet name matching ALL keywords (accent- and
-    case-insensitive), so small naming variations in the master Excel (e.g.
-    'SANA' vs 'SANA Objectives') don't crash the app with a hard KeyError."""
     normalized = {s: _norm_header(s) for s in available_sheets}
     for sheet, upper in normalized.items():
         if all(_norm_header(kw) in upper for kw in keywords):
@@ -568,39 +587,74 @@ def build_master_maps(xlsx_bytes: bytes):
     return icao_map, l1_map, l2_map, sana_map, matriculas_map
 
 
-def choose_effective_operator(prefix3: str, matricula: str, icao_map: Dict[str, str], matriculas_map: Dict[str, str]) -> Tuple[str, str]:
+def choose_effective_operator(effective_code: str, matricula: str, icao_map: Dict[str, str], matriculas_map: Dict[str, str]) -> Tuple[str, str]:
     matricula_norm = str(matricula).strip().upper() if matricula else ""
     matricula_nohyphen = matricula_norm.replace("-", "")
     if matricula_norm and matricula_norm in matriculas_map:
         return matriculas_map[matricula_norm], "Operador matrícula"
     if matricula_nohyphen and matricula_nohyphen in matriculas_map:
         return matriculas_map[matricula_nohyphen], "Operador matrícula"
-    prefix3_norm = str(prefix3).strip().upper() if prefix3 else ""
-    if prefix3_norm in icao_map:
-        return icao_map[prefix3_norm], "Operador prefijo ICAO"
+    code_norm = str(effective_code).strip().upper() if effective_code else ""
+    if code_norm in icao_map:
+        return icao_map[code_norm], "Operador código ICAO"
     return "", "Sin operador"
 
 
-def cross_reference(row: pd.Series, maps) -> CrossResult:
-    icao_map, l1_map, l2_map, sana_map, matriculas_map = maps
-    operador, fuente_operador = choose_effective_operator(row.get("prefix3", ""), row.get("Matricula", ""), icao_map, matriculas_map)
-    prefix3 = str(row.get("prefix3", "")).strip().upper()
+def cross_reference(row: pd.Series, maps, external_codes: Dict[str, Optional[str]]) -> CrossResult:
+    """Determines the operator code used to enter the master Excel.
 
-    if prefix3 in l1_map:
-        item = l1_map[prefix3]
-        return CrossResult("Layer 1", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 1")
-    if prefix3 in sana_map:
-        item = sana_map[prefix3]
-        return CrossResult("SANA", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + SANA")
-    if prefix3 in l2_map:
-        item = l2_map[prefix3]
-        return CrossResult("Layer 2", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 2")
-    return CrossResult("No encontrado", operador, None, None, None, "", fuente_operador)
+    Per spec: the PRIMARY key is the 3-letter operator code returned by the
+    external registration lookup (hexdb.io, standing in for Airframes.org —
+    see module docstring). The flight-number prefix from the PDF (prefix3)
+    is only a FALLBACK, used when the registration isn't found externally.
+    Two situations raise a visible warning (returned in `alerta`, rendered
+    as an orange row downstream):
+      1. The registration has no external record at all -> fall back to
+         the flight-number code.
+      2. The external operator code DISAGREES with the flight-number code
+         -> the external code is still used to enter the Excel, but the
+         mismatch is flagged for manual review.
+    """
+    icao_map, l1_map, l2_map, sana_map, matriculas_map = maps
+    matricula = str(row.get("Matricula", "")).strip().upper()
+    prefix3_vuelo = str(row.get("prefix3", "")).strip().upper()
+    external_code = external_codes.get(matricula) if matricula else None
+
+    alerta = ""
+    if matricula and not external_code:
+        effective_code = prefix3_vuelo
+        alerta = (
+            f"Matrícula {matricula} no encontrada en la base de registros externa; "
+            f"se ha usado el código de vuelo ({prefix3_vuelo or 'sin código'}) para el cruce."
+        )
+    elif external_code and prefix3_vuelo and external_code != prefix3_vuelo:
+        effective_code = external_code
+        alerta = (
+            f"El operador de la matrícula {matricula} según la base externa ({external_code}) "
+            f"no coincide con el código de vuelo del PDF ({prefix3_vuelo}). Se ha usado el "
+            f"código externo ({external_code}) para el cruce; revisar manualmente."
+        )
+    else:
+        effective_code = external_code or prefix3_vuelo
+
+    operador, fuente_operador = choose_effective_operator(effective_code, matricula, icao_map, matriculas_map)
+
+    if effective_code in l1_map:
+        item = l1_map[effective_code]
+        return CrossResult("Layer 1", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 1", external_code or "", alerta)
+    if effective_code in sana_map:
+        item = sana_map[effective_code]
+        return CrossResult("SANA", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + SANA", external_code or "", alerta)
+    if effective_code in l2_map:
+        item = l2_map[effective_code]
+        return CrossResult("Layer 2", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 2", external_code or "", alerta)
+    return CrossResult("No encontrado", operador, None, None, None, "", fuente_operador, external_code or "", alerta)
 
 
 def enrich_flights(df: pd.DataFrame, maps) -> pd.DataFrame:
     enriched = df.copy()
-    results = enriched.apply(lambda row: cross_reference(row, maps), axis=1)
+    external_codes = build_external_operator_map(enriched["Matricula"].tolist() if "Matricula" in enriched.columns else [])
+    results = enriched.apply(lambda row: cross_reference(row, maps, external_codes), axis=1)
     enriched["Operador (maestro)"] = [r.operador for r in results]
     enriched["Tipo objetivo"] = [r.tipo for r in results]
     enriched["Inspecciones realizadas"] = [r.inspecciones for r in results]
@@ -608,6 +662,8 @@ def enrich_flights(df: pd.DataFrame, maps) -> pd.DataFrame:
     enriched["Restantes"] = [r.restantes for r in results]
     enriched["Última inspección"] = [r.ultima for r in results]
     enriched["Fuente cruce"] = [r.fuente for r in results]
+    enriched["Código externo (hexdb.io)"] = [r.codigo_externo for r in results]
+    enriched["Aviso matrícula"] = [r.alerta for r in results]
     return enriched
 
 
@@ -619,9 +675,11 @@ def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
     title_font = Font(bold=True, size=14, color="FFFFFF")
     header_font = Font(bold=True, color="FFFFFF")
     body_font = Font(size=10)
+    warning_font = Font(size=10, bold=True)
     border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
+    warning_fill = PatternFill("solid", fgColor="FFC000")
 
-    ws.merge_cells("B2:N2")
+    ws.merge_cells("B2:O2")
     ws["B2"] = f"Cruce tráfico NOP + Objetivos SAFA/SACA/SANA ({fecha_str})"
     ws["B2"].font = title_font
     ws["B2"].fill = PatternFill("solid", fgColor="1F4E78")
@@ -636,19 +694,23 @@ def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border
 
-    centered = {"Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "Tipo objetivo", "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección"}
+    centered = {"Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "Tipo objetivo", "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección", "Código externo (hexdb.io)"}
+    alerta_col_idx = headers.index("Aviso matrícula") if "Aviso matrícula" in headers else None
     for row_num, (_, row) in enumerate(df.iterrows(), start=header_row + 1):
+        tiene_aviso = alerta_col_idx is not None and bool(str(row[headers[alerta_col_idx]]).strip())
         for col_num, header in enumerate(headers, start=2):
             value = None if pd.isna(row[header]) else row[header]
             cell = ws.cell(row=row_num, column=col_num, value=value)
-            cell.font = body_font
+            cell.font = warning_font if tiene_aviso else body_font
             cell.border = border
             cell.alignment = Alignment(horizontal="center", vertical="center") if header in centered else Alignment(horizontal="left", vertical="center", indent=1)
+            if tiene_aviso:
+                cell.fill = warning_fill
 
     last_row = header_row + len(df)
     last_col = 1 + len(headers)
     last_col_letter = get_column_letter(last_col)
-    widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "Matricula": 12, "ADEP": 8, "ADES": 8, "Operador (maestro)": 42, "Tipo objetivo": 14, "Inspecciones realizadas": 12, "Objetivo 2026": 12, "Restantes": 10, "Última inspección": 16, "Fuente cruce": 24}
+    widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "Matricula": 12, "ADEP": 8, "ADES": 8, "Operador (maestro)": 42, "Tipo objetivo": 14, "Inspecciones realizadas": 12, "Objetivo 2026": 12, "Restantes": 10, "Última inspección": 16, "Fuente cruce": 24, "Código externo (hexdb.io)": 14, "Aviso matrícula": 55}
     for col_num, header in enumerate(headers, start=2):
         ws.column_dimensions[get_column_letter(col_num)].width = widths.get(header, 14)
 
@@ -663,8 +725,9 @@ def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
     ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"No encontrado"'], fill=PatternFill("solid", fgColor="FFC7CE")))
 
     note_row = last_row + 3
-    ws.cell(row=note_row, column=2, value="Fuente: PDF NOP Eurocontrol + Excel maestro Objetivos_SAFA_SACA_SANA_Matriculas.").font = Font(size=8, italic=True, color="808080")
-    ws.cell(row=note_row + 1, column=2, value=f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}").font = Font(size=8, italic=True, color="808080")
+    ws.cell(row=note_row, column=2, value="Fuente: PDF NOP Eurocontrol + Excel maestro Objetivos_SAFA_SACA_SANA_Matriculas + hexdb.io (operador por matrícula).").font = Font(size=8, italic=True, color="808080")
+    ws.cell(row=note_row + 1, column=2, value="Filas en naranja: matrícula no encontrada externamente, o discrepancia entre operador externo y código de vuelo. Revisar manualmente.").font = Font(size=8, italic=True, color="808080")
+    ws.cell(row=note_row + 2, column=2, value=f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}").font = Font(size=8, italic=True, color="808080")
 
     buf = BytesIO()
     wb.save(buf)
@@ -682,21 +745,28 @@ def build_pdf(df: pd.DataFrame, fecha_str: str) -> BytesIO:
     story = [Paragraph(f"Cruce tráfico NOP + Objetivos SAFA/SACA/SANA ({fecha_str})", title_style), Spacer(1, 6 * mm)]
 
     headers = list(df.columns)
-    rows_per_page = 30
+    alerta_col_idx = headers.index("Aviso matrícula") if "Aviso matrícula" in headers else None
+    rows_per_page = 25
     for start in range(0, len(df), rows_per_page):
         chunk = df.iloc[start:start + rows_per_page]
         table_data = [[Paragraph(str(h), small) for h in headers]]
-        for _, row in chunk.iterrows():
+        warning_row_indices = []
+        for local_idx, (_, row) in enumerate(chunk.iterrows(), start=1):
             table_data.append([Paragraph("" if pd.isna(row[h]) else str(row[h]), small) for h in headers])
+            if alerta_col_idx is not None and str(row[headers[alerta_col_idx]]).strip():
+                warning_row_indices.append(local_idx)
         table = Table(table_data, repeatRows=1)
-        table.setStyle(TableStyle([
+        style_cmds = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9D9D9")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ]))
+        ]
+        for idx in warning_row_indices:
+            style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), colors.HexColor("#FFC000")))
+        table.setStyle(TableStyle(style_cmds))
         story.append(table)
         if start + rows_per_page < len(df):
             story.append(PageBreak())
@@ -729,11 +799,7 @@ def apply_filters(result_df: pd.DataFrame) -> pd.DataFrame:
         max_restantes = int(restantes_num.max()) if restantes_num.notna().any() else 0
         restantes_range = st.slider("Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1)), key="filtro_restantes")
     with col6:
-        fechas_validas = pd.to_datetime(result_df["Última inspección"], errors="coerce")
-        min_fecha = fechas_validas.min().date() if fechas_validas.notna().any() else datetime.now().date()
-        max_fecha = fechas_validas.max().date() if fechas_validas.notna().any() else datetime.now().date()
-        preset_sel = st.selectbox("Última inspección", ["Todas las fechas", "Última semana", "Último mes", "No en la última semana", "No en el último mes", "Rango personalizado"], index=0, key="filtro_preset")
-        fecha_range = st.date_input("Rango personalizado de fechas", value=(min_fecha, max_fecha), key="filtro_fecha_range") if preset_sel == "Rango personalizado" else None
+        solo_avisos = st.checkbox("Mostrar solo filas con aviso (matrícula)", value=False, key="filtro_solo_avisos")
 
     filtered_df = result_df.copy()
     if texto_busqueda.strip():
@@ -753,22 +819,9 @@ def apply_filters(result_df: pd.DataFrame) -> pd.DataFrame:
     rest_num_full = pd.to_numeric(filtered_df["Restantes"], errors="coerce")
     filtered_df = filtered_df[rest_num_full.isna() | rest_num_full.between(restantes_range[0], restantes_range[1])]
 
-    hoy = datetime.now().date()
-    fechas_filtro = pd.to_datetime(filtered_df["Última inspección"], errors="coerce")
-    if preset_sel == "Última semana":
-        limite = hoy - pd.Timedelta(days=7)
-        filtered_df = filtered_df[fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)]
-    elif preset_sel == "Último mes":
-        limite = hoy - pd.Timedelta(days=30)
-        filtered_df = filtered_df[fechas_filtro.notna() & (fechas_filtro.dt.date >= limite) & (fechas_filtro.dt.date <= hoy)]
-    elif preset_sel == "No en la última semana":
-        limite = hoy - pd.Timedelta(days=7)
-        filtered_df = filtered_df[fechas_filtro.isna() | (fechas_filtro.dt.date < limite)]
-    elif preset_sel == "No en el último mes":
-        limite = hoy - pd.Timedelta(days=30)
-        filtered_df = filtered_df[fechas_filtro.isna() | (fechas_filtro.dt.date < limite)]
-    elif preset_sel == "Rango personalizado" and isinstance(fecha_range, tuple) and len(fecha_range) == 2:
-        filtered_df = filtered_df[fechas_filtro.isna() | ((fechas_filtro.dt.date >= fecha_range[0]) & (fechas_filtro.dt.date <= fecha_range[1]))]
+    if solo_avisos:
+        filtered_df = filtered_df[filtered_df["Aviso matrícula"].astype(str).str.strip() != ""]
+
     return filtered_df
 
 
@@ -784,10 +837,6 @@ def render_app():
 
     run_clicked = st.button("Generar cruce", type="primary", disabled=not (pdf_file and xlsx_file))
 
-    # Streamlit buttons only return True on the exact rerun triggered by the
-    # click; any later interaction (a filter widget, the second button below)
-    # would otherwise wipe the whole screen. We persist the processed result
-    # in st.session_state so it survives reruns.
     if run_clicked:
         pdf_bytes = pdf_file.read()
         xlsx_bytes = xlsx_file.read()
@@ -811,6 +860,15 @@ def render_app():
     fecha_str = st.session_state["fecha_str"]
 
     st.success(f"Cruce completado con {len(result_df)} vuelos procesados.")
+
+    n_avisos = int((result_df["Aviso matrícula"].astype(str).str.strip() != "").sum())
+    if n_avisos > 0:
+        st.warning(
+            f"{n_avisos} vuelo(s) tienen un aviso de matrícula (no encontrada en hexdb.io, o "
+            f"discrepancia entre el operador externo y el código de vuelo). Están marcados en "
+            f"naranja en la tabla y en los archivos descargables."
+        )
+
     if expected_total is not None:
         missing = max(expected_total - len(result_df), 0)
         coverage = (len(result_df) / expected_total * 100) if expected_total else 0
@@ -837,8 +895,14 @@ def render_app():
         col.metric(tipo, n)
 
     filtered_df = apply_filters(result_df)
-    st.caption(f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros.")
-    st.dataframe(filtered_df, use_container_width=True, height=500)
+    st.caption(f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros. Las filas con aviso de matrícula se resaltan en naranja.")
+
+    def _highlight_avisos(row):
+        if str(row.get("Aviso matrícula", "")).strip():
+            return ["background-color: #FFC000; font-weight: bold"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(filtered_df.style.apply(_highlight_avisos, axis=1), use_container_width=True, height=500)
 
     excel_buf_filtered = build_excel(filtered_df.reset_index(drop=True), fecha_str)
     pdf_buf_filtered = build_pdf(filtered_df.reset_index(drop=True), fecha_str)
