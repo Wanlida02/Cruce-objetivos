@@ -30,9 +30,21 @@ APP_CAPTION = (
     "Sube el PDF de la lista de tráfico (NOP Eurocontrol, formato ARCID) y el Excel maestro "
     "de Objetivos SAFA/SACA/SANA/Matrículas. La app busca cada matrícula en una base pública "
     "de registros (hexdb.io) para obtener el código de operador real, y cruza ese código con "
-    "el Excel maestro. Si la matrícula no se encuentra, o si el operador externo no coincide "
-    "con el código de vuelo del PDF, la fila se marca en naranja como aviso."
+    "el Excel maestro. Si el operador externo no coincide con el código de vuelo del PDF, el "
+    "texto de esa fila se marca en naranja como aviso."
 )
+
+# ============================================================
+# FINAL OUTPUT COLUMNS (exact set and order requested)
+# ============================================================
+OUTPUT_COLUMNS = [
+    "Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "prefix3",
+    "Código externo", "Operador (maestro)", "Tipo objetivo",
+    "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección",
+]
+# Columns whose values must render as whole numbers (no decimals) everywhere:
+# on-screen table, Excel, and PDF exports.
+INTEGER_COLUMNS = {"Inspecciones realizadas", "Objetivo 2026", "Restantes"}
 
 # ============================================================
 # AIRCRAFT TYPE DESIGNATORS (ICAO Doc 8643) — comprehensive list
@@ -117,6 +129,7 @@ TIME_PAT_F1 = re.compile(r"^(\d{2}:\d{2})A\s*(.*)$")
 FLIGHT_LINE_PAT_F1 = re.compile(r"^\d{2}:\d{2}A")
 FLIGHT_START_PAT_F2 = re.compile(r"(\d{2}:\d{2})([AEC])(?=\s?(?:[A-Z]{1,4}\s?)?[A-Z]{1,4}\d)")
 EXPECTED_TOTAL_PAT = re.compile(r"-\s*(\d+)\s*Flights", re.IGNORECASE)
+AIRPORT_PAT = re.compile(r"^[A-Z0-9]{4}$")
 
 CURRENT_PDF_ICAOS: set = set()
 
@@ -149,9 +162,8 @@ class CrossResult:
     objetivo: Optional[object]
     restantes: Optional[object]
     ultima: str
-    fuente: str
     codigo_externo: str
-    alerta: str
+    discrepancia: bool  # True only when external operator code != flight-number code
 
 
 def _norm_header(value) -> str:
@@ -187,6 +199,23 @@ def choose_best_registration(reg_raw: str) -> str:
     return hyphenate_registration(reg_raw)
 
 
+def to_int_or_none(value):
+    """Coerces a numeric-looking value (possibly float, e.g. 3.0) to a plain
+    Python int for display; returns None for missing/non-numeric values so
+    downstream renderers show a blank cell instead of 'NaN' or '3.0'."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str) and not value.strip():
+            return None
+        f = float(value)
+        if pd.isna(f):
+            return None
+        return int(round(f))
+    except (TypeError, ValueError):
+        return None
+
+
 def looks_like_format2(text_sample: str) -> bool:
     for line in text_sample.splitlines():
         line = line.strip()
@@ -206,7 +235,7 @@ def extract_reg_airports(block: str) -> Tuple[str, str, str]:
     return "", compact, ""
 
 
-def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
+def parse_format1(raw_lines: List[str]) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
     merged, current = [], None
     for line in raw_lines:
         if FLIGHT_LINE_PAT_F1.match(line):
@@ -219,6 +248,7 @@ def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
         merged.append(current)
 
     rows = []
+    unparsed = []
     for line in merged:
         match = TIME_PAT_F1.match(line)
         if not match:
@@ -231,11 +261,14 @@ def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
         atyp_match = ATYP_PAT.search(rest)
 
         if not atyp_match:
-            first_token = rest.split(" ")[0] if rest else ""
-            rows.append({"Hora": hora, "ARCID": first_token, "Aeronave": "", "Matricula": "", "ADEP": "", "ADES": "", "prefix3": first_token[:3]})
+            unparsed.append({"Hora": hora, "raw": rest[:60], "motivo": "Tipo de aeronave no reconocido"})
             continue
 
         arcid = rest[:atyp_match.start()].strip()
+        if not re.search(r"\d", arcid):
+            unparsed.append({"Hora": hora, "raw": rest[:60], "motivo": "Indicativo sin número de vuelo (posible aeronave privada/GA)"})
+            continue
+
         atyp = atyp_match.group(1)
         remainder = rest[atyp_match.end():].replace(" ", "")
         matricula = hyphenate_registration(remainder[:5]) if len(remainder) >= 5 else ""
@@ -248,28 +281,36 @@ def parse_format1(raw_lines: List[str]) -> pd.DataFrame:
             "ADES": remainder[9:13],
             "prefix3": re.match(r"^[A-Z]{3}", arcid).group(0) if re.match(r"^[A-Z]{3}", arcid) else arcid[:3],
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), unparsed
 
 
-def parse_one_flight_chunk(hora: str, rest: str) -> Optional[Dict[str, str]]:
-    rest = rest.lstrip()
+def parse_one_flight_chunk(hora: str, rest: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Parses one flight chunk. Returns (parsed_row, None) on success, or
+    (None, reason) when the chunk doesn't match the expected structure —
+    callers must surface `reason` in the "vuelos no detectados" list rather
+    than silently forcing a row with garbage data."""
+    rest_stripped = rest.lstrip()
 
-    atyp_match = ATYP_PAT.search(rest)
+    atyp_match = ATYP_PAT.search(rest_stripped)
     if not atyp_match:
-        return None
+        return None, "Tipo de aeronave no reconocido"
 
-    prefix = rest[:atyp_match.start()]
+    prefix = rest_stripped[:atyp_match.start()]
     atyp = atyp_match.group(1)
-    remainder = rest[atyp_match.end():]
+    remainder = rest_stripped[atyp_match.end():]
 
     dm = re.search(r"\d", prefix)
-    if dm:
-        alpha_run = prefix[:dm.start()]
-        digit_start = dm.start()
-    else:
-        alpha_run = prefix
-        digit_start = len(prefix)
+    if dm is None:
+        # No digit anywhere in the prefix: this is not a standard "airline +
+        # flight number" ARCID. It's almost always a private/GA aircraft whose
+        # callsign IS its own all-letter registration (e.g. Spanish "EC-NCL"),
+        # which then repeats a few characters later as the actual registration
+        # field. Forcing the airline-code heuristic on it produces a
+        # meaningless 3-letter ARCID. Flag it for manual review instead.
+        return None, "Indicativo sin número de vuelo (posible aeronave privada/GA)"
 
+    alpha_run = prefix[:dm.start()]
+    digit_start = dm.start()
     airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
     arcid = (airline_code + prefix[digit_start:]).strip()
 
@@ -277,17 +318,22 @@ def parse_one_flight_chunk(hora: str, rest: str) -> Optional[Dict[str, str]]:
     reg_airport_block = remainder[:anchor.start()] if anchor else remainder
 
     reg_raw, adep, ades = extract_reg_airports(reg_airport_block)
+
+    if not AIRPORT_PAT.match(adep or "") or not AIRPORT_PAT.match(ades or ""):
+        return None, "Formato de ADEP/ADES inesperado tras el parsing"
+
     reg = hyphenate_registration(reg_raw) if reg_raw else ""
 
     return {
         "Hora": hora, "ARCID": arcid.strip(), "Aeronave": atyp, "Matricula": reg,
         "ADEP": adep, "ADES": ades,
         "prefix3": airline_code.strip(),
-    }
+    }, None
 
 
-def parse_format2(raw_lines: List[str]) -> pd.DataFrame:
+def parse_format2(raw_lines: List[str]) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
     rows = []
+    unparsed = []
     for ln in raw_lines:
         matches = list(FLIGHT_START_PAT_F2.finditer(ln))
         if not matches:
@@ -297,10 +343,12 @@ def parse_format2(raw_lines: List[str]) -> pd.DataFrame:
             chunk_start = m.end()
             chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
             chunk = ln[chunk_start:chunk_end]
-            parsed = parse_one_flight_chunk(hora, chunk)
+            parsed, reason = parse_one_flight_chunk(hora, chunk)
             if parsed:
                 rows.append(parsed)
-    return pd.DataFrame(rows)
+            else:
+                unparsed.append({"Hora": hora, "raw": chunk.strip()[:60], "motivo": reason})
+    return pd.DataFrame(rows), unparsed
 
 
 def extract_expected_total(pdf_bytes: bytes) -> Optional[int]:
@@ -313,59 +361,15 @@ def extract_expected_total(pdf_bytes: bytes) -> Optional[int]:
     return None
 
 
-def extract_raw_arcid_candidates(pdf_bytes: bytes) -> pd.DataFrame:
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        raw_lines = []
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            raw_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
-
-    full_text = "\n".join(raw_lines)
-    candidates = []
-    if looks_like_format2(full_text):
-        for ln in raw_lines:
-            matches = list(FLIGHT_START_PAT_F2.finditer(ln))
-            for i, m in enumerate(matches):
-                hora = m.group(1)
-                chunk_start = m.end()
-                chunk_end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
-                chunk = ln[chunk_start:chunk_end].lstrip()
-                am = ATYP_PAT.search(chunk)
-                prefix = chunk[:am.start()] if am else chunk[:12]
-                dm = re.search(r"\d", prefix)
-                alpha_run = prefix[:dm.start()] if dm else prefix
-                digit_start = dm.start() if dm else len(prefix)
-                airline_code = alpha_run[-3:] if len(alpha_run) >= 3 else alpha_run
-                arcid_guess = airline_code + prefix[digit_start:]
-                candidates.append({"Hora": hora, "ARCID_guess": arcid_guess.strip(), "parsed_ok": am is not None})
-    else:
-        merged = []
-        current = None
-        for ln in raw_lines:
-            if FLIGHT_LINE_PAT_F1.match(ln):
-                if current:
-                    merged.append(current)
-                current = ln
-            elif current:
-                current += " " + ln
-        if current:
-            merged.append(current)
-        for ln in merged:
-            m = TIME_PAT_F1.match(ln)
-            if not m:
-                continue
-            hora, rest = m.group(1), m.group(2)
-            tokens = rest.split(" ")
-            while tokens and re.fullmatch(r"[A-Z]{1,4}", tokens[0]) and not re.search(r"\d", tokens[0]):
-                tokens.pop(0)
-            rest2 = " ".join(tokens)
-            am = ATYP_PAT.search(rest2)
-            arcid_guess = rest2[:am.start()].strip() if am else (rest2.split(" ")[0] if rest2 else "")
-            candidates.append({"Hora": hora, "ARCID_guess": arcid_guess, "parsed_ok": am is not None})
-    return pd.DataFrame(candidates)
-
-
-def parse_pdf_flights(pdf_bytes: bytes) -> pd.DataFrame:
+def parse_pdf_flights(pdf_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Extracts (Hora, ARCID, Aeronave, Matricula, ADEP, ADES, prefix3) from
+    either of the two known NOP/CFMU PDF traffic-list layouts. Returns
+    (parsed_df, undetected_df): `undetected_df` lists every line the parser
+    could identify as a flight-start marker but could NOT turn into a valid
+    row (unrecognized aircraft type, missing flight number, malformed
+    airports, etc.), each with the specific reason, so they can be reviewed
+    individually instead of vanishing silently or polluting the main table
+    with garbage rows."""
     global CURRENT_PDF_ICAOS
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         raw_lines = []
@@ -377,11 +381,12 @@ def parse_pdf_flights(pdf_bytes: bytes) -> pd.DataFrame:
     CURRENT_PDF_ICAOS = set(re.findall(r"[A-Z]{4}", full_text))
 
     if looks_like_format2(full_text):
-        df = parse_format2(raw_lines)
+        df, unparsed = parse_format2(raw_lines)
     else:
-        df = parse_format1(raw_lines)
+        df, unparsed = parse_format1(raw_lines)
 
-    return df
+    unparsed_df = pd.DataFrame(unparsed, columns=["Hora", "raw", "motivo"]) if unparsed else pd.DataFrame(columns=["Hora", "raw", "motivo"])
+    return df, unparsed_df
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
@@ -391,11 +396,10 @@ def hexdb_lookup_operator_code(registration: str) -> Optional[str]:
     Two-step lookup (documented at https://hexdb.io/): first resolve the
     registration to its ICAO24 Mode-S hex address, then fetch the aircraft
     record for that hex, which includes 'OperatorFlagCode' — the 3-letter
-    operator code (e.g. 'EZY' for easyJet), analogous to the 'MAY' example
-    used to specify this feature. Returns None if the registration isn't
-    found, the hex has no matching record, or any network error occurs —
-    callers must treat None as "use the flight-number operator code instead
-    and flag the row as a warning".
+    operator code (e.g. 'EZY' for easyJet). Returns None if the registration
+    isn't found, the hex has no matching record, or any network error
+    occurs — callers must treat None as "fall back to the flight-number
+    operator code, no warning needed".
     """
     reg = (registration or "").strip().upper()
     if not reg:
@@ -587,84 +591,74 @@ def build_master_maps(xlsx_bytes: bytes):
     return icao_map, l1_map, l2_map, sana_map, matriculas_map
 
 
-def choose_effective_operator(effective_code: str, matricula: str, icao_map: Dict[str, str], matriculas_map: Dict[str, str]) -> Tuple[str, str]:
+def choose_effective_operator(effective_code: str, matricula: str, icao_map: Dict[str, str], matriculas_map: Dict[str, str]) -> str:
     matricula_norm = str(matricula).strip().upper() if matricula else ""
     matricula_nohyphen = matricula_norm.replace("-", "")
     if matricula_norm and matricula_norm in matriculas_map:
-        return matriculas_map[matricula_norm], "Operador matrícula"
+        return matriculas_map[matricula_norm]
     if matricula_nohyphen and matricula_nohyphen in matriculas_map:
-        return matriculas_map[matricula_nohyphen], "Operador matrícula"
+        return matriculas_map[matricula_nohyphen]
     code_norm = str(effective_code).strip().upper() if effective_code else ""
     if code_norm in icao_map:
-        return icao_map[code_norm], "Operador código ICAO"
-    return "", "Sin operador"
+        return icao_map[code_norm]
+    return ""
 
 
 def cross_reference(row: pd.Series, maps, external_codes: Dict[str, Optional[str]]) -> CrossResult:
     """Determines the operator code used to enter the master Excel.
 
-    Per spec: the PRIMARY key is the 3-letter operator code returned by the
-    external registration lookup (hexdb.io, standing in for Airframes.org —
-    see module docstring). The flight-number prefix from the PDF (prefix3)
-    is only a FALLBACK, used when the registration isn't found externally.
-    Two situations raise a visible warning (returned in `alerta`, rendered
-    as an orange row downstream):
-      1. The registration has no external record at all -> fall back to
-         the flight-number code.
-      2. The external operator code DISAGREES with the flight-number code
-         -> the external code is still used to enter the Excel, but the
-         mismatch is flagged for manual review.
+    Primary key: the 3-letter operator code returned by the external
+    registration lookup (hexdb.io). The flight-number prefix from the PDF
+    (prefix3) is the FALLBACK, used only when the registration has no
+    external record — that case is treated as normal, no visual warning.
+    A warning (`discrepancia=True`) is raised ONLY when the external code
+    disagrees with the flight-number code; the external code still wins
+    for the actual Excel cross-reference, but the mismatch is flagged so
+    the affected text can be rendered in orange for manual review.
     """
     icao_map, l1_map, l2_map, sana_map, matriculas_map = maps
     matricula = str(row.get("Matricula", "")).strip().upper()
     prefix3_vuelo = str(row.get("prefix3", "")).strip().upper()
     external_code = external_codes.get(matricula) if matricula else None
 
-    alerta = ""
-    if matricula and not external_code:
-        effective_code = prefix3_vuelo
-        alerta = (
-            f"Matrícula {matricula} no encontrada en la base de registros externa; "
-            f"se ha usado el código de vuelo ({prefix3_vuelo or 'sin código'}) para el cruce."
-        )
-    elif external_code and prefix3_vuelo and external_code != prefix3_vuelo:
-        effective_code = external_code
-        alerta = (
-            f"El operador de la matrícula {matricula} según la base externa ({external_code}) "
-            f"no coincide con el código de vuelo del PDF ({prefix3_vuelo}). Se ha usado el "
-            f"código externo ({external_code}) para el cruce; revisar manualmente."
-        )
-    else:
-        effective_code = external_code or prefix3_vuelo
+    discrepancia = bool(external_code and prefix3_vuelo and external_code != prefix3_vuelo)
+    effective_code = external_code or prefix3_vuelo
 
-    operador, fuente_operador = choose_effective_operator(effective_code, matricula, icao_map, matriculas_map)
+    operador = choose_effective_operator(effective_code, matricula, icao_map, matriculas_map)
 
     if effective_code in l1_map:
         item = l1_map[effective_code]
-        return CrossResult("Layer 1", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 1", external_code or "", alerta)
+        return CrossResult("Layer 1", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), external_code or "", discrepancia)
     if effective_code in sana_map:
         item = sana_map[effective_code]
-        return CrossResult("SANA", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + SANA", external_code or "", alerta)
+        return CrossResult("SANA", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), external_code or "", discrepancia)
     if effective_code in l2_map:
         item = l2_map[effective_code]
-        return CrossResult("Layer 2", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), f"{fuente_operador} + Layer 2", external_code or "", alerta)
-    return CrossResult("No encontrado", operador, None, None, None, "", fuente_operador, external_code or "", alerta)
+        return CrossResult("Layer 2", str(item.get("operator") or operador), item.get("done"), item.get("objective"), item.get("remaining"), fmt_date(item.get("last")), external_code or "", discrepancia)
+    return CrossResult("No encontrado", operador, None, None, None, "", external_code or "", discrepancia)
 
 
 def enrich_flights(df: pd.DataFrame, maps) -> pd.DataFrame:
     enriched = df.copy()
     external_codes = build_external_operator_map(enriched["Matricula"].tolist() if "Matricula" in enriched.columns else [])
     results = enriched.apply(lambda row: cross_reference(row, maps, external_codes), axis=1)
+    enriched["Código externo"] = [r.codigo_externo for r in results]
     enriched["Operador (maestro)"] = [r.operador for r in results]
     enriched["Tipo objetivo"] = [r.tipo for r in results]
-    enriched["Inspecciones realizadas"] = [r.inspecciones for r in results]
-    enriched["Objetivo 2026"] = [r.objetivo for r in results]
-    enriched["Restantes"] = [r.restantes for r in results]
+    enriched["Inspecciones realizadas"] = [to_int_or_none(r.inspecciones) for r in results]
+    enriched["Objetivo 2026"] = [to_int_or_none(r.objetivo) for r in results]
+    enriched["Restantes"] = [to_int_or_none(r.restantes) for r in results]
     enriched["Última inspección"] = [r.ultima for r in results]
-    enriched["Fuente cruce"] = [r.fuente for r in results]
-    enriched["Código externo (hexdb.io)"] = [r.codigo_externo for r in results]
-    enriched["Aviso matrícula"] = [r.alerta for r in results]
-    return enriched
+    enriched["_discrepancia"] = [r.discrepancia for r in results]
+    return enriched[OUTPUT_COLUMNS + ["_discrepancia"]]
+
+
+def _fmt_cell(value):
+    """Renders ints without decimals and blanks for missing values, leaving
+    every other column type untouched."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return value
 
 
 def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
@@ -675,17 +669,19 @@ def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
     title_font = Font(bold=True, size=14, color="FFFFFF")
     header_font = Font(bold=True, color="FFFFFF")
     body_font = Font(size=10)
-    warning_font = Font(size=10, bold=True)
+    warning_font = Font(size=10, bold=True, color="E36C0A")  # orange text only
     border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
-    warning_fill = PatternFill("solid", fgColor="FFC000")
 
-    ws.merge_cells("B2:O2")
+    headers = [c for c in OUTPUT_COLUMNS]
+    last_col = 1 + len(headers)
+    last_col_letter = get_column_letter(last_col)
+
+    ws.merge_cells(f"B2:{last_col_letter}2")
     ws["B2"] = f"Cruce tráfico NOP + Objetivos SAFA/SACA/SANA ({fecha_str})"
     ws["B2"].font = title_font
     ws["B2"].fill = PatternFill("solid", fgColor="1F4E78")
     ws["B2"].alignment = Alignment(horizontal="center", vertical="center")
 
-    headers = list(df.columns)
     header_row = 4
     for col_num, header in enumerate(headers, start=2):
         cell = ws.cell(row=header_row, column=col_num, value=header)
@@ -694,23 +690,23 @@ def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border
 
-    centered = {"Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "Tipo objetivo", "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección", "Código externo (hexdb.io)"}
-    alerta_col_idx = headers.index("Aviso matrícula") if "Aviso matrícula" in headers else None
+    centered = {"Hora", "ARCID", "Aeronave", "Matricula", "ADEP", "ADES", "prefix3", "Código externo", "Tipo objetivo", "Inspecciones realizadas", "Objetivo 2026", "Restantes", "Última inspección"}
     for row_num, (_, row) in enumerate(df.iterrows(), start=header_row + 1):
-        tiene_aviso = alerta_col_idx is not None and bool(str(row[headers[alerta_col_idx]]).strip())
+        tiene_discrepancia = bool(row.get("_discrepancia", False))
         for col_num, header in enumerate(headers, start=2):
-            value = None if pd.isna(row[header]) else row[header]
+            value = row[header]
+            if header in INTEGER_COLUMNS:
+                value = to_int_or_none(value)
+            value = None if (value is None or (isinstance(value, float) and pd.isna(value))) else value
             cell = ws.cell(row=row_num, column=col_num, value=value)
-            cell.font = warning_font if tiene_aviso else body_font
+            cell.font = warning_font if tiene_discrepancia else body_font
             cell.border = border
             cell.alignment = Alignment(horizontal="center", vertical="center") if header in centered else Alignment(horizontal="left", vertical="center", indent=1)
-            if tiene_aviso:
-                cell.fill = warning_fill
+            if header in INTEGER_COLUMNS and value is not None:
+                cell.number_format = "0"
 
     last_row = header_row + len(df)
-    last_col = 1 + len(headers)
-    last_col_letter = get_column_letter(last_col)
-    widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "Matricula": 12, "ADEP": 8, "ADES": 8, "Operador (maestro)": 42, "Tipo objetivo": 14, "Inspecciones realizadas": 12, "Objetivo 2026": 12, "Restantes": 10, "Última inspección": 16, "Fuente cruce": 24, "Código externo (hexdb.io)": 14, "Aviso matrícula": 55}
+    widths = {"Hora": 8, "ARCID": 12, "Aeronave": 11, "Matricula": 12, "ADEP": 8, "ADES": 8, "prefix3": 9, "Código externo": 14, "Operador (maestro)": 42, "Tipo objetivo": 14, "Inspecciones realizadas": 12, "Objetivo 2026": 12, "Restantes": 10, "Última inspección": 16}
     for col_num, header in enumerate(headers, start=2):
         ws.column_dimensions[get_column_letter(col_num)].width = widths.get(header, 14)
 
@@ -726,7 +722,7 @@ def build_excel(df: pd.DataFrame, fecha_str: str) -> BytesIO:
 
     note_row = last_row + 3
     ws.cell(row=note_row, column=2, value="Fuente: PDF NOP Eurocontrol + Excel maestro Objetivos_SAFA_SACA_SANA_Matriculas + hexdb.io (operador por matrícula).").font = Font(size=8, italic=True, color="808080")
-    ws.cell(row=note_row + 1, column=2, value="Filas en naranja: matrícula no encontrada externamente, o discrepancia entre operador externo y código de vuelo. Revisar manualmente.").font = Font(size=8, italic=True, color="808080")
+    ws.cell(row=note_row + 1, column=2, value="Texto en naranja: el operador de hexdb.io no coincide con el código de vuelo del PDF. Revisar manualmente.").font = Font(size=8, italic=True, color="808080")
     ws.cell(row=note_row + 2, column=2, value=f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}").font = Font(size=8, italic=True, color="808080")
 
     buf = BytesIO()
@@ -742,31 +738,33 @@ def build_pdf(df: pd.DataFrame, fecha_str: str) -> BytesIO:
     title_style = styles["Heading1"]
     title_style.alignment = 1
     small = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, leading=10)
+    small_orange = ParagraphStyle("small_orange", parent=small, textColor=colors.HexColor("#E36C0A"))
     story = [Paragraph(f"Cruce tráfico NOP + Objetivos SAFA/SACA/SANA ({fecha_str})", title_style), Spacer(1, 6 * mm)]
 
-    headers = list(df.columns)
-    alerta_col_idx = headers.index("Aviso matrícula") if "Aviso matrícula" in headers else None
+    headers = OUTPUT_COLUMNS
     rows_per_page = 25
     for start in range(0, len(df), rows_per_page):
         chunk = df.iloc[start:start + rows_per_page]
         table_data = [[Paragraph(str(h), small) for h in headers]]
-        warning_row_indices = []
-        for local_idx, (_, row) in enumerate(chunk.iterrows(), start=1):
-            table_data.append([Paragraph("" if pd.isna(row[h]) else str(row[h]), small) for h in headers])
-            if alerta_col_idx is not None and str(row[headers[alerta_col_idx]]).strip():
-                warning_row_indices.append(local_idx)
+        for _, row in chunk.iterrows():
+            style_for_row = small_orange if bool(row.get("_discrepancia", False)) else small
+            cells = []
+            for h in headers:
+                v = row[h]
+                if h in INTEGER_COLUMNS:
+                    v = to_int_or_none(v)
+                v = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else v
+                cells.append(Paragraph(str(v), style_for_row))
+            table_data.append(cells)
         table = Table(table_data, repeatRows=1)
-        style_cmds = [
+        table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9D9D9")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ]
-        for idx in warning_row_indices:
-            style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), colors.HexColor("#FFC000")))
-        table.setStyle(TableStyle(style_cmds))
+        ]))
         story.append(table)
         if start + rows_per_page < len(df):
             story.append(PageBreak())
@@ -799,7 +797,7 @@ def apply_filters(result_df: pd.DataFrame) -> pd.DataFrame:
         max_restantes = int(restantes_num.max()) if restantes_num.notna().any() else 0
         restantes_range = st.slider("Restantes (rango)", 0, max(max_restantes, 1), (0, max(max_restantes, 1)), key="filtro_restantes")
     with col6:
-        solo_avisos = st.checkbox("Mostrar solo filas con aviso (matrícula)", value=False, key="filtro_solo_avisos")
+        solo_discrepancias = st.checkbox("Mostrar solo discrepancias (operador ≠ código de vuelo)", value=False, key="filtro_solo_disc")
 
     filtered_df = result_df.copy()
     if texto_busqueda.strip():
@@ -819,8 +817,8 @@ def apply_filters(result_df: pd.DataFrame) -> pd.DataFrame:
     rest_num_full = pd.to_numeric(filtered_df["Restantes"], errors="coerce")
     filtered_df = filtered_df[rest_num_full.isna() | rest_num_full.between(restantes_range[0], restantes_range[1])]
 
-    if solo_avisos:
-        filtered_df = filtered_df[filtered_df["Aviso matrícula"].astype(str).str.strip() != ""]
+    if solo_discrepancias:
+        filtered_df = filtered_df[filtered_df["_discrepancia"] == True]
 
     return filtered_df
 
@@ -840,13 +838,12 @@ def render_app():
     if run_clicked:
         pdf_bytes = pdf_file.read()
         xlsx_bytes = xlsx_file.read()
-        flights_df = parse_pdf_flights(pdf_bytes)
+        flights_df, undetected_df = parse_pdf_flights(pdf_bytes)
         maps = build_master_maps(xlsx_bytes)
         result_df = enrich_flights(flights_df, maps)
-        raw_candidates_df = extract_raw_arcid_candidates(pdf_bytes)
         expected_total = extract_expected_total(pdf_bytes)
         st.session_state["result_df"] = result_df
-        st.session_state["raw_candidates_df"] = raw_candidates_df
+        st.session_state["undetected_df"] = undetected_df
         st.session_state["expected_total"] = expected_total
         st.session_state["fecha_str"] = datetime.now().strftime("%Y%m%d")
 
@@ -855,38 +852,35 @@ def render_app():
         return
 
     result_df = st.session_state["result_df"]
-    raw_candidates_df = st.session_state["raw_candidates_df"]
+    undetected_df = st.session_state["undetected_df"]
     expected_total = st.session_state["expected_total"]
     fecha_str = st.session_state["fecha_str"]
 
     st.success(f"Cruce completado con {len(result_df)} vuelos procesados.")
 
-    n_avisos = int((result_df["Aviso matrícula"].astype(str).str.strip() != "").sum())
-    if n_avisos > 0:
+    n_discrepancias = int(result_df["_discrepancia"].sum())
+    if n_discrepancias > 0:
         st.warning(
-            f"{n_avisos} vuelo(s) tienen un aviso de matrícula (no encontrada en hexdb.io, o "
-            f"discrepancia entre el operador externo y el código de vuelo). Están marcados en "
-            f"naranja en la tabla y en los archivos descargables."
+            f"{n_discrepancias} vuelo(s) tienen el operador de hexdb.io distinto al código de "
+            f"vuelo del PDF. El texto de esas filas aparece en naranja en la tabla y en los "
+            f"archivos descargables."
         )
 
     if expected_total is not None:
         missing = max(expected_total - len(result_df), 0)
         coverage = (len(result_df) / expected_total * 100) if expected_total else 0
         st.caption(f"Cobertura: {len(result_df)} / {expected_total} vuelos ({coverage:.1f}%). Faltantes estimados: {missing}.")
-        if missing > 0 and not raw_candidates_df.empty:
-            if st.button("Ver vuelos no detectados"):
-                st.session_state["show_missing"] = not st.session_state.get("show_missing", False)
-            if st.session_state.get("show_missing"):
-                detected_arcids = set(result_df["ARCID"].astype(str).str.upper())
-                rc = raw_candidates_df.copy()
-                rc["ARCID_norm"] = rc["ARCID_guess"].astype(str).str.upper()
-                no_detectados = rc[~rc["ARCID_norm"].isin(detected_arcids)]
-                if no_detectados.empty:
-                    st.success("No se han encontrado vuelos adicionales sin detectar.")
-                else:
-                    st.markdown(f"**{len(no_detectados)} vuelo(s) presentes en el texto del PDF pero ausentes en la tabla final:**")
-                    st.dataframe(no_detectados[["Hora", "ARCID_guess", "parsed_ok"]].rename(columns={"ARCID_guess": "ARCID (detectado en texto crudo)", "parsed_ok": "Se pudo parsear tipo/aeropuertos"}), use_container_width=True)
-    else:
+
+    if not undetected_df.empty:
+        if st.button(f"Ver vuelos no detectados ({len(undetected_df)})"):
+            st.session_state["show_missing"] = not st.session_state.get("show_missing", False)
+        if st.session_state.get("show_missing"):
+            st.markdown(f"**{len(undetected_df)} línea(s) del PDF no se pudieron convertir en una fila válida:**")
+            st.dataframe(
+                undetected_df.rename(columns={"raw": "Texto original (recortado)", "motivo": "Motivo"}),
+                use_container_width=True,
+            )
+    elif expected_total is None:
         st.caption(f"No se ha podido leer el total declarado de vuelos en el PDF; se muestran los {len(result_df)} vuelos detectados.")
 
     counts = result_df["Tipo objetivo"].value_counts()
@@ -895,14 +889,19 @@ def render_app():
         col.metric(tipo, n)
 
     filtered_df = apply_filters(result_df)
-    st.caption(f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros. Las filas con aviso de matrícula se resaltan en naranja.")
+    st.caption(f"Mostrando {len(filtered_df)} de {len(result_df)} vuelos tras aplicar filtros. El texto en naranja indica discrepancia entre el operador externo y el código de vuelo.")
 
-    def _highlight_avisos(row):
-        if str(row.get("Aviso matrícula", "")).strip():
-            return ["background-color: #FFC000; font-weight: bold"] * len(row)
+    display_df = filtered_df[OUTPUT_COLUMNS].copy()
+    for col in INTEGER_COLUMNS:
+        display_df[col] = display_df[col].apply(to_int_or_none)
+
+    def _highlight_text(row):
+        idx = row.name
+        if filtered_df.loc[idx, "_discrepancia"]:
+            return ["color: #E36C0A; font-weight: bold"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(filtered_df.style.apply(_highlight_avisos, axis=1), use_container_width=True, height=500)
+    st.dataframe(display_df.style.apply(_highlight_text, axis=1), use_container_width=True, height=500)
 
     excel_buf_filtered = build_excel(filtered_df.reset_index(drop=True), fecha_str)
     pdf_buf_filtered = build_pdf(filtered_df.reset_index(drop=True), fecha_str)
