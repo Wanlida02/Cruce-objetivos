@@ -25,9 +25,9 @@ st.set_page_config(page_title="GCTS - Cruce Objetivos SAFA/SACA/SANA", layout="w
 
 APP_TITLE = "Cruce automático: Lista de tráfico (NOP) + Objetivos SAFA/SACA/SANA"
 APP_CAPTION = (
-    "Sube el PDF NOP y el Excel maestro. La matrícula del Excel maestro tiene prioridad "
-    "para determinar el código operativo de cruce; hexdb.io y el código de vuelo se usan "
-    "como contraste."
+    "Sube el PDF NOP y el Excel maestro. OpenSky Network es la fuente prioritaria para "
+    "determinar el operador de cada matrícula; si no tiene dato, se usa el Excel maestro, "
+    "y hexdb.io y el código de vuelo quedan como contraste adicional."
 )
 
 OUTPUT_COLUMNS = [
@@ -86,6 +86,15 @@ HEXDB_REG_HEX_URL = "https://hexdb.io/reg-hex"
 HEXDB_AIRCRAFT_URL = "https://hexdb.io/api/v1/aircraft/{hex}"
 HEXDB_REQUEST_TIMEOUT = 5
 HEXDB_REQUEST_DELAY = 0.25
+
+# OpenSky Network - "Aircraft Database": volcado mensual (CSV) con matrícula,
+# operador y código de operador. Es la fuente más oficial y tiene prioridad
+# sobre el Excel maestro, hexdb.io y el código de vuelo (a petición de Fran).
+# No existe una API en vivo de OpenSky que dé el operador: su API en tiempo
+# real solo da posición/indicativo, por eso se usa este volcado.
+OPENSKY_DB_URL_TEMPLATE = "https://s3.opensky-network.org/data-samples/metadata/aircraft-database-complete-{}.csv"
+OPENSKY_DB_REQUEST_TIMEOUT = 60
+OPENSKY_DB_MONTHS_TO_TRY = 4  # el volcado del mes actual puede tardar en publicarse
 
 
 @dataclass
@@ -262,8 +271,7 @@ def extract_expected_total(pdf_bytes: bytes) -> Optional[int]:
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def hexdb_lookup_operator_code(registration: str) -> Optional[str]:
     """Optional external reference only. It never overrides a matching
-    registration from the Excel master, which is the authoritative source
-    for this inspection-planning workflow."""
+    registration from OpenSky or the Excel master (see resolve_operator_code)."""
     reg = (registration or "").strip().upper()
     if not reg:
         return None
@@ -296,6 +304,51 @@ def build_external_operator_map(registrations: List[str]) -> Dict[str, Optional[
             progress.progress(i / len(regs), text=f"Consultando hexdb.io: {i} / {len(regs)} matrículas")
     progress.empty()
     return output
+
+
+@st.cache_data(show_spinner="Descargando base de datos de aeronaves de OpenSky Network...", ttl=60 * 60 * 24)
+def load_opensky_registration_maps() -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Descarga el volcado mensual de la Aircraft Database de OpenSky Network
+    y construye dos mapas por matrícula: código de operador (OACI) y nombre
+    de operador. Se cachea 24h para no volver a descargar el fichero (varias
+    decenas de MB) en cada cruce. Si la descarga falla por cualquier motivo
+    (sin red, formato cambiado, mes aún no publicado...) se devuelven mapas
+    vacíos: el cruce sigue funcionando igual con el Excel maestro, hexdb.io
+    y el código de vuelo, sin romperse."""
+    reg_code_map: Dict[str, str] = {}
+    reg_operator_map: Dict[str, str] = {}
+    now = datetime.now()
+    year, month = now.year, now.month
+    for _ in range(OPENSKY_DB_MONTHS_TO_TRY):
+        url = OPENSKY_DB_URL_TEMPLATE.format(f"{year}-{month:02d}")
+        try:
+            r = requests.get(url, timeout=OPENSKY_DB_REQUEST_TIMEOUT)
+            if r.status_code == 200 and r.content:
+                df = pd.read_csv(
+                    BytesIO(r.content),
+                    usecols=["registration", "operatorIcao", "operator"],
+                    dtype=str,
+                    low_memory=False,
+                    on_bad_lines="skip",
+                )
+                for reg, code, name in zip(df["registration"], df["operatorIcao"], df["operator"]):
+                    reg_key = normalize_registration(reg)
+                    if not reg_key:
+                        continue
+                    code = str(code or "").strip().upper()
+                    name = str(name or "").strip()
+                    if code and reg_key not in reg_code_map:
+                        reg_code_map[reg_key] = code
+                    if name and reg_key not in reg_operator_map:
+                        reg_operator_map[reg_key] = name
+                if reg_code_map:
+                    break
+        except Exception:
+            pass
+        month -= 1
+        if month == 0:
+            month, year = 12, year - 1
+    return reg_code_map, reg_operator_map
 
 
 def load_sheet(xlsx_bytes: bytes, name: str, max_col: int = 60):
@@ -388,17 +441,28 @@ def build_master_maps(xlsx_bytes: bytes):
     return icao_map, l1_map, l2_map, sana_map, matriculas_map, registration_code_map
 
 
-def resolve_operator_code(registration: str, flight_code: str, external_code: Optional[str], registration_code_map: Dict[str, str]):
-    """Priority: Excel registration mapping > external API > flight code.
+def resolve_operator_code(registration: str, flight_code: str, external_code: Optional[str],
+                           opensky_code: Optional[str], registration_code_map: Dict[str, str]):
+    """Prioridad: OpenSky Network > matrícula en Excel maestro > hexdb.io > código de vuelo.
 
-    The Excel mapping is authoritative. Thus EC-NZR maps to OVA when OVA's
-    'Registration Markings' includes EC-NZR, even if AEA appears in the
-    flight plan and is returned by an external data provider.
+    OpenSky Network es la fuente más oficial disponible y gana siempre que
+    tenga dato para la matrícula. Si OpenSky no tiene dato, se mantiene el
+    criterio anterior: el Excel maestro es autoritativo frente a hexdb.io y
+    al código de vuelo del plan.
     """
     reg_key = normalize_registration(registration)
     flight = str(flight_code or "").strip().upper()
     external = str(external_code or "").strip().upper()
+    opensky = str(opensky_code or "").strip().upper()
     excel_code = registration_code_map.get(reg_key, "")
+
+    if opensky:
+        discrepancy = bool(
+            (excel_code and excel_code != opensky)
+            or (external and external != opensky)
+            or (flight and flight != opensky)
+        )
+        return opensky, discrepancy
     if excel_code:
         discrepancy = bool((flight and flight != excel_code) or (external and external != excel_code))
         return excel_code, discrepancy
@@ -407,14 +471,17 @@ def resolve_operator_code(registration: str, flight_code: str, external_code: Op
     return flight, False
 
 
-def cross_reference(row: pd.Series, maps, external_codes: Dict[str, Optional[str]]) -> CrossResult:
+def cross_reference(row: pd.Series, maps, external_codes: Dict[str, Optional[str]],
+                     opensky_codes: Dict[str, str], opensky_operators: Dict[str, str]) -> CrossResult:
     icao_map, l1_map, l2_map, sana_map, matriculas_map, reg_code_map = maps
     reg = str(row.get("Matricula", "")).strip().upper()
+    reg_key = normalize_registration(reg)
     flight_code = str(row.get("prefix3", "")).strip().upper()
     external_code = external_codes.get(reg)
-    code, discrepancy = resolve_operator_code(reg, flight_code, external_code, reg_code_map)
+    opensky_code = opensky_codes.get(reg_key)
+    code, discrepancy = resolve_operator_code(reg, flight_code, external_code, opensky_code, reg_code_map)
 
-    operator = matriculas_map.get(normalize_registration(reg), "") or icao_map.get(code, "")
+    operator = matriculas_map.get(reg_key, "") or opensky_operators.get(reg_key, "") or icao_map.get(code, "")
     if code in l1_map:
         x = l1_map[code]
         return CrossResult("Layer 1", str(x["operator"] or operator), x["done"], x["objective"], x["remaining"], fmt_date(x["last"]), external_code or "", discrepancy, code)
@@ -429,7 +496,8 @@ def cross_reference(row: pd.Series, maps, external_codes: Dict[str, Optional[str
 
 def enrich_flights(df: pd.DataFrame, maps) -> pd.DataFrame:
     codes = build_external_operator_map(df["Matricula"].tolist())
-    results = df.apply(lambda row: cross_reference(row, maps, codes), axis=1)
+    opensky_codes, opensky_operators = load_opensky_registration_maps()
+    results = df.apply(lambda row: cross_reference(row, maps, codes, opensky_codes, opensky_operators), axis=1)
     out = df.copy()
     out["Código externo"] = [r.codigo_externo for r in results]
     out["Operador (maestro)"] = [r.operador for r in results]
@@ -481,8 +549,8 @@ def build_excel(df: pd.DataFrame, fecha: str) -> BytesIO:
     ws.freeze_panes = "B5"
     ws.auto_filter.ref = f"B4:{last_col}{4 + len(df)}"
     note = 7 + len(df)
-    ws.cell(note, 2, "Prioridad de operador: matrícula en Excel maestro > hexdb.io > código de vuelo.").font = Font(size=8, italic=True, color="808080")
-    ws.cell(note + 1, 2, "Texto naranja: discrepancia entre el código seleccionado y el código del vuelo o hexdb.io.").font = Font(size=8, italic=True, color="808080")
+    ws.cell(note, 2, "Prioridad de operador: OpenSky Network > matrícula en Excel maestro > hexdb.io > código de vuelo.").font = Font(size=8, italic=True, color="808080")
+    ws.cell(note + 1, 2, "Texto naranja: discrepancia entre el código seleccionado y el código del vuelo, hexdb.io u OpenSky.").font = Font(size=8, italic=True, color="808080")
     b = BytesIO(); wb.save(b); b.seek(0); return b
 
 
