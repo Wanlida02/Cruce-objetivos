@@ -640,8 +640,8 @@ def render_app():
     st.dataframe(display.style.apply(style_row, axis=1), use_container_width=True, height=500)
     date = st.session_state["date"]
     a, b = st.columns(2)
-    with a: st.download_button("Descargar Excel filtrado", build_excel(filtered, date), f"GCTS_{date}_filtrado.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with b: st.download_button("Descargar PDF filtrado", build_pdf(filtered, date), f"GCTS_{date}_filtrado.pdf", "application/pdf")
+    with a: st.download_button("Descargar Excel filtrado", build_excel(filtered, date), "NOP filtrado.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with b: st.download_button("Descargar PDF filtrado", build_pdf(filtered, date), "NOP filtrado.pdf", "application/pdf")
 
 if __name__ == "__main__":
     render_app()
