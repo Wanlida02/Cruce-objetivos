@@ -55,13 +55,35 @@ F100 F27 F28 F2TH F406 F50 F70 F900 FA50 FA6X FA7X FA8X
 G150 G159 G200 G280 G650 G73T GA5C GA6C GA7C GA8 GALX GL5T GL7T GLEX GLF4 GLF5 GLF6
 H25B H25C HDJT I114 IL18 IL62 IL76 IL86 IL96 J328 JS31 JS32 JS41 K35R
 L101 L188 L410 LJ31 LJ35 LJ40 LJ45 LJ60 LJ70 LJ75
-M20P M20T MD11 MD81 MD82 MD83 MD87 MD88 MD90 MU2 N262 NOMA
-P180 P206 P208 P210 P28A P28B P28R P28T P68C P8 P92 PA28 PA34 PA44 PA46 PAY2 PC12 PC24 PRM1
+M20P M20T M600 MD11 MD81 MD82 MD83 MD87 MD88 MD90 MU2 N262 NOMA
+P06T P180 P206 P208 P210 P28A P28B P28R P28T P68C P8 P92 PA28 PA34 PA44 PA46 PAY2 PC12 PC24 PRM1
 RJ1H RJ70 RJ85 S601 SB20 SC7 SF34 SH33 SH36 SR20 SR22 SU95 SW4
 T134 T154 T204 TBM7 TBM8 TBM9 TU34 TU54 WW24 Y12 YK40 YK42 YS11
 """.split()
 ATYP_CODES = sorted(set(ATYP_CODES_RAW), key=len, reverse=True)
 ATYP_PAT = re.compile(r"(" + "|".join(re.escape(c) for c in ATYP_CODES) + r")")
+# Indicativo (3 letras + numero + hasta 3 caracteres) seguido del tipo de
+# aeronave. Evita que un tipo (BCS1, BCS3, P8...) se detecte DENTRO del
+# propio indicativo (BCS196, BCS3UP, HOP84NN...). Admite un prefijo corto
+# del tipo "LU " antes del indicativo.
+CALLSIGN_ATYP_PAT = re.compile(
+    r"^(?:[A-Z]{1,2}\s+)?([A-Z]{3}\d[A-Z0-9]{0,3})\s?(" + "|".join(re.escape(c) for c in ATYP_CODES) + r")"
+)
+
+
+def find_callsign_atyp(rest: str):
+    """Devuelve (fin_indicativo, inicio_tipo, fin_tipo, codigo_tipo) o None.
+    Primero intenta el formato normal (indicativo + tipo); si no encaja, usa
+    la busqueda antigua del primer tipo que aparezca en el texto."""
+    m = CALLSIGN_ATYP_PAT.match(rest)
+    if m:
+        return m.end(1), m.start(2), m.end(2), m.group(2)
+    m = ATYP_PAT.search(rest)
+    if m:
+        return m.start(), m.start(), m.end(), m.group(1)
+    return None
+
+
 
 REG_PREFIXES_ALL = """
 A9C 4YB 9XR 9A 9G 9H 9J 9K 9L 9M 9N 9Q 9U 9V 9Y 4K 4L 4O 4R 4X
@@ -180,12 +202,12 @@ def extract_reg_airports(block: str) -> Tuple[str, str, str]:
 
 def parse_one_flight_chunk(hora: str, rest: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     rest = rest.lstrip()
-    atyp_match = ATYP_PAT.search(rest)
-    if not atyp_match:
+    found = find_callsign_atyp(rest)
+    if not found:
         return None, "Tipo de aeronave no reconocido"
-    prefix = rest[:atyp_match.start()]
-    atyp = atyp_match.group(1)
-    remainder = rest[atyp_match.end():]
+    prefix_end, _atyp_start, atyp_end, atyp = found
+    prefix = rest[:prefix_end]
+    remainder = rest[atyp_end:]
     dm = re.search(r"\d", prefix)
     if dm is None:
         return None, "Indicativo sin número de vuelo (posible aeronave privada/GA)"
@@ -234,16 +256,17 @@ def parse_format1(raw_lines: List[str]) -> Tuple[pd.DataFrame, List[Dict[str, st
         if not m:
             continue
         hora, rest = m.group(1), m.group(2)
-        atyp_match = ATYP_PAT.search(rest)
-        if not atyp_match:
+        found = find_callsign_atyp(rest)
+        if not found:
             unparsed.append({"Hora": hora, "raw": rest[:80], "motivo": "Tipo de aeronave no reconocido"})
             continue
-        prefix = rest[:atyp_match.start()].strip()
+        prefix_end, _atyp_start, atyp_end, atyp = found
+        prefix = rest[:prefix_end].strip()
         if not re.search(r"\d", prefix):
             unparsed.append({"Hora": hora, "raw": rest[:80], "motivo": "Indicativo sin número de vuelo"})
             continue
-        rem = rest[atyp_match.end():].replace(" ", "")
-        rows.append({"Hora": hora, "ARCID": prefix, "Aeronave": atyp_match.group(1),
+        rem = rest[atyp_end:].replace(" ", "")
+        rows.append({"Hora": hora, "ARCID": prefix, "Aeronave": atyp,
                      "Matricula": hyphenate_registration(rem[:5]), "ADEP": rem[5:9],
                      "ADES": rem[9:13], "prefix3": prefix[:3]})
     return pd.DataFrame(rows), unparsed
