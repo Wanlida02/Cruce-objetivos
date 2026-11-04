@@ -62,6 +62,9 @@ T134 T154 T204 TBM7 TBM8 TBM9 TU34 TU54 WW24 Y12 YK40 YK42 YS11
 """.split()
 ATYP_CODES = sorted(set(ATYP_CODES_RAW), key=len, reverse=True)
 ATYP_PAT = re.compile(r"(" + "|".join(re.escape(c) for c in ATYP_CODES) + r")")
+# Tipos de aeronave de KLM Cityhopper (indicativo KLM, codigo OACI KLC).
+KLM_CITYHOPPER_TYPES = {"E170", "E175", "E75L", "E75S", "E190", "E195", "E290", "E295"}
+
 # Indicativo (3 letras + numero + hasta 3 caracteres) seguido del tipo de
 # aeronave. Evita que un tipo (BCS1, BCS3, P8...) se detecte DENTRO del
 # propio indicativo (BCS196, BCS3UP, HOP84NN...). Admite un prefijo corto
@@ -503,6 +506,10 @@ def cross_reference(row: pd.Series, maps, external_codes: Dict[str, Optional[str
     external_code = external_codes.get(reg)
     opensky_code = opensky_codes.get(reg_key)
     code, discrepancy = resolve_operator_code(reg, flight_code, external_code, opensky_code, reg_code_map)
+    # KLM Cityhopper vuela con indicativo KLM pero su codigo OACI es KLC: sus
+    # Embraer (E170/E175/E190/E195/E2) se cruzan como KLC, no como KLM.
+    if code == "KLM" and str(row.get("Aeronave", "")).strip().upper() in KLM_CITYHOPPER_TYPES:
+        code, discrepancy = "KLC", False
 
     operator = matriculas_map.get(reg_key, "") or opensky_operators.get(reg_key, "") or icao_map.get(code, "")
     if code in l1_map:
